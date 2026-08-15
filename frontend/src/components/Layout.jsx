@@ -1,0 +1,104 @@
+import { useState } from 'react'
+import { NavLink, useNavigate } from 'react-router-dom'
+import { useAuth } from '../auth'
+
+const icons = {
+  customers: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
+  ),
+  kanban: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16" /></svg>
+  ),
+  dashboard: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" /></svg>
+  ),
+  tasks: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" /></svg>
+  ),
+  stages: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16" /></svg>
+  ),
+  import: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+  ),
+  users: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+  ),
+  audit: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+  ),
+  logout: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+  ),
+  menu: (
+    <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
+  ),
+}
+
+let setSidebarOpenGlobal = null
+
+export function Sidebar({ navItems }) {
+  const { logout, user } = useAuth()
+  const navigate = useNavigate()
+  const [open, setOpen] = useState(false)
+  setSidebarOpenGlobal = setOpen
+
+  const close = () => setOpen(false)
+
+  return (
+    <>
+      <div className={`sidebar-overlay${open ? ' show' : ''}`} onClick={close} />
+      <aside className={`sidebar${open ? ' open' : ''}`}>
+        <div className="sidebar-brand">
+          <span className="dot">●</span> CRM
+        </div>
+        <nav className="sidebar-nav">
+          {navItems.map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              end={item.end}
+              className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
+              onClick={close}
+            >
+              {icons[item.icon]}
+              {item.label}
+            </NavLink>
+          ))}
+          <button className="sidebar-link" onClick={() => { logout(); navigate('/auth/login') }}>
+            {icons.logout}
+            退出登录
+          </button>
+        </nav>
+      </aside>
+    </>
+  )
+}
+
+export function Topbar() {
+  const { user } = useAuth()
+  return (
+    <div className="topbar">
+      <div className="user-chip">
+        <span>{user?.display_name || user?.username || '用户'}</span>
+        <span className="role-tag">{user?.role === 'admin' ? 'ADMIN' : 'MEMBER'}</span>
+      </div>
+    </div>
+  )
+}
+
+export function Page({ children }) {
+  const openSidebar = () => setSidebarOpenGlobal?.(true)
+  return (
+    <div className="main">
+      <button className="hamburger" onClick={openSidebar}>
+        {icons.menu}
+        菜单
+      </button>
+      <Topbar />
+      {children}
+    </div>
+  )
+}
+
+export { icons }

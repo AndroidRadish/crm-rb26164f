@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: crm_rb26164f_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-crm_rb26164f_pass_2026}
+      POSTGRES_DB: crm_rb26164f
+    volumes:
+      - crm_rb26164f_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: crm_rb26164f_backend
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    volumes:
+      - ./bin/crm-rb26164f:/app/crm-rb26164f:ro
+      - ./migrations:/app/migrations:ro
+    environment:
+      DATABASE_URL: postgres://crm:${DB_PASSWORD:-crm_rb26164f_pass_2026}@db:5432/crm_rb26164f
+      JWT_SECRET: ${JWT_SECRET:-crm_rb26164f_jwt_secret_2026}
+      RUST_LOG: info
+      PORT: "9092"
+      MIGRATIONS_DIR: /app/migrations
+      WECOM_WEBHOOK_URL: ${WECOM_WEBHOOK_URL:-}
+      DINGTALK_WEBHOOK_URL: ${DINGTALK_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: nginx:alpine
+    container_name: crm_rb26164f_frontend
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+
+networks:
+  default:
+
+volumes:
+  crm_rb26164f_pgdata:

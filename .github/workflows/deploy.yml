@@ -1,0 +1,77 @@
+name: test-build-deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# 约定：master 上的每个 commit 都可上生产。测试不过 → 不部署。
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 建测试库
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE crm_rb26164f_test"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 集成测试
+        run: cargo test --test integration -- --test-threads=1
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/crm_rb26164f_test
+
+  build-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: 交叉编译（musl 静态二进制）
+        run: cargo zigbuild --target x86_64-unknown-linux-musl --release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 构建前端（base=/crm/ 由 .env.production 提供）
+        run: cd frontend && npm ci && npm run build
+
+      - name: 部署到生产服务器
+        env:
+          DEPLOY_KEY: ${{ secrets.CRM_RB26164F_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && echo "$DEPLOY_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 124.223.13.181 >> ~/.ssh/known_hosts 2>/dev/null
+          SSH="ssh -o BatchMode=yes -i ~/.ssh/deploy_key root@124.223.13.181"
+          SCP="scp -o BatchMode=yes -i ~/.ssh/deploy_key"
+          $SSH "docker stop crm_rb26164f_backend"
+          $SCP target/x86_64-unknown-linux-musl/release/crm-rb26164f root@124.223.13.181:/opt/crm-rb26164f/bin/crm-rb26164f
+          $SSH "rm -rf /opt/crm-rb26164f/frontend/*"
+          $SCP -r frontend/dist/* root@124.223.13.181:/opt/crm-rb26164f/frontend/
+          $SSH "docker start crm_rb26164f_backend"
+
+      - name: 上线验证
+        run: |
+          sleep 5
+          curl -fsS -o /dev/null https://bionicroot.cn/crm/
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST https://bionicroot.cn/crm/api/auth/login \
+            -H "Content-Type: application/json" -d '{"username":"__healthcheck__","password":"x"}')
+          [ "$code" -lt 500 ] && echo "部署验证通过（前端 200 / API $code）"
