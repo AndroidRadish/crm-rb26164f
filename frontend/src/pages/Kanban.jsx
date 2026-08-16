@@ -155,7 +155,7 @@ export default function Kanban() {
                       onClick={() => navigate(`/customers/${c.id}`)}
                     >
                       <div className="kanban-card-company" title={c.company}>{c.company}</div>
-                      <div className="kanban-card-contact">
+                      <div className="kanban-card-contact" title={(c.contact_name || '—') + (c.phone ? ` · ${c.phone}` : '')}>
                         {c.contact_name || '—'} {c.phone ? `· ${c.phone}` : ''}
                       </div>
                       <div className="kanban-card-owner">
