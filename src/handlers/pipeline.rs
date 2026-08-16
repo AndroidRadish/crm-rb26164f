@@ -10,6 +10,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::models::pipeline::{CreatePipelineEntryRequest, PipelineEntry};
+use crate::models::user::UserRole;
 use crate::services::{audit, auth};
 
 fn unauthorized() -> impl IntoResponse {
@@ -328,8 +329,20 @@ pub async fn kanban(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
         }
     };
 
-    // 获取当前 scope 内的客户（含阶段信息）
-    let scope = auth::scope_where(&user, "c");
+    // 获取看板可见客户（含阶段信息）
+    // 管理员：全部客户；成员：自己名下 + 公海池（owner_id IS NULL，可认领）
+    let scope = match user.role {
+        UserRole::Admin => {
+            format!("c.tenant_id = '{}'", user.tenant_id)
+        }
+        UserRole::Member => {
+            format!(
+                "c.tenant_id = '{}' AND (c.owner_id = '{}' OR c.owner_id IS NULL)",
+                user.tenant_id, user.user_id
+            )
+        }
+    };
+    // 查询客户（含阶段信息）
     let customers = match sqlx::query_as::<_, crate::models::customer::Customer>(&format!(
         "SELECT c.id, c.tenant_id, c.company, c.contact_name, c.phone, c.email, c.address, \
          c.notes, c.owner_id, c.stage, c.source, c.duplicate_of, c.created_at, c.updated_at \
@@ -349,12 +362,54 @@ pub async fn kanban(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
         }
     };
 
+    // 查询负责人 display_name 映射（owner_id -> display_name）
+    let owner_names: std::collections::HashMap<Uuid, String> = match sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, COALESCE(display_name, username) FROM users WHERE tenant_id = $1",
+    )
+    .bind(user.tenant_id)
+    .fetch_all(&pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(_) => std::collections::HashMap::new(),
+    };
+
+    // 将客户转换为 JSON（附加 owner_name）
+    let customers_json: Vec<serde_json::Value> = customers
+        .iter()
+        .map(|c| {
+            let owner_name = c.owner_id.and_then(|oid| owner_names.get(&oid).cloned());
+            serde_json::json!({
+                "id": c.id,
+                "tenant_id": c.tenant_id,
+                "company": c.company,
+                "contact_name": c.contact_name,
+                "phone": c.phone,
+                "email": c.email,
+                "address": c.address,
+                "notes": c.notes,
+                "owner_id": c.owner_id,
+                "owner_name": owner_name,
+                "stage": c.stage,
+                "source": c.source,
+                "duplicate_of": c.duplicate_of,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+            })
+        })
+        .collect();
+
     // 按阶段分组
     let mut columns: Vec<serde_json::Value> = Vec::new();
     for stage in &stages {
-        let stage_customers: Vec<&crate::models::customer::Customer> = customers
+        let stage_customers: Vec<&serde_json::Value> = customers_json
             .iter()
-            .filter(|c| c.stage == Some(stage.id))
+            .filter(|c| {
+                c.get("stage")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s == stage.id.to_string().as_str())
+                    .unwrap_or(false)
+            })
             .collect();
         columns.push(serde_json::json!({
             "stage_id": stage.id,

@@ -556,6 +556,96 @@ async fn test_kanban_and_funnel() {
 }
 
 #[tokio::test]
+async fn test_kanban_member_sees_public_pool() {
+    let base = start_server().await;
+    let client = Client::new();
+    let _admin_token = setup_user(&client, &base, "admin13", "admin123", "admin").await;
+    let member_token = setup_user(&client, &base, "member6", "member123", "member").await;
+
+    // 直接插入公海客户（owner_id = NULL）并设置阶段
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test".to_string()
+    });
+    let pool = crm_rb26164f::db::init_db(&database_url)
+        .await
+        .expect("pool init");
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM tenants ORDER BY created_at LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("tenant");
+    let stage_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM stages ORDER BY order_index LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("stage");
+    let customer_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO customers (tenant_id, company, contact_name, owner_id, stage, source) \
+         VALUES ($1, '公海看板公司', '公海联系人', NULL, $2, 'manual') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(stage_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert pool customer");
+
+    // 成员看板应能看到公海客户（owner_id IS NULL）
+    let resp = client
+        .get(&format!("{}/api/pipeline/kanban", base))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let columns = body.as_array().unwrap();
+    let mut found = false;
+    for col in columns {
+        let customers = col["customers"].as_array().unwrap();
+        for c in customers {
+            if c["id"].as_str().unwrap() == customer_id.to_string().as_str() {
+                assert!(c["owner_id"].is_null(), "public pool customer should have null owner_id");
+                found = true;
+            }
+        }
+    }
+    assert!(found, "member kanban should include public pool customer");
+
+    // 成员认领后，看板应显示该客户且 owner_id 非空
+    let resp = client
+        .post(&format!("{}/api/customers/{}/claim", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let resp = client
+        .get(&format!("{}/api/pipeline/kanban", base))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let columns = body.as_array().unwrap();
+    let mut found_claimed = false;
+    for col in columns {
+        let customers = col["customers"].as_array().unwrap();
+        for c in customers {
+            if c["id"].as_str().unwrap() == customer_id.to_string().as_str() {
+                assert!(!c["owner_id"].is_null(), "claimed customer should have owner_id");
+                assert!(
+                    c["owner_name"].is_string(),
+                    "claimed customer should have owner_name"
+                );
+                found_claimed = true;
+            }
+        }
+    }
+    assert!(found_claimed, "member kanban should include claimed customer");
+}
+
+#[tokio::test]
 async fn test_dashboard() {
     let base = start_server().await;
     let client = Client::new();

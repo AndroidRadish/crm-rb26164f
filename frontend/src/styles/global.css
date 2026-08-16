@@ -564,6 +564,35 @@ table.data tbody tr:hover td { background: rgba(34, 197, 94, 0.06); }
   color: var(--color-text-secondary);
 }
 
+.kanban-card-owner {
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.kanban-owner-mine {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.kanban-owner-other {
+  color: var(--color-text-secondary);
+}
+
+.kanban-owner-pool {
+  color: var(--color-text-muted);
+}
+
+.kanban-card-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 6px;
+}
+
+.kanban-card-actions .btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 .kanban-empty {
   text-align: center;
   color: var(--color-text-muted);
