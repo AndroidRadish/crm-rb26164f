@@ -154,7 +154,7 @@ export default function Kanban() {
                       onDragStart={(e) => handleDragStart(e, c.id, col.stage_id)}
                       onClick={() => navigate(`/customers/${c.id}`)}
                     >
-                      <div className="kanban-card-company">{c.company}</div>
+                      <div className="kanban-card-company" title={c.company}>{c.company}</div>
                       <div className="kanban-card-contact">
                         {c.contact_name || '—'} {c.phone ? `· ${c.phone}` : ''}
                       </div>
