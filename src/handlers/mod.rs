@@ -5,5 +5,6 @@ pub mod customers;
 pub mod health;
 pub mod import;
 pub mod pipeline;
+pub mod settings;
 pub mod stages;
 pub mod tasks;

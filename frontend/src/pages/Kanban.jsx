@@ -42,7 +42,8 @@ export default function Kanban() {
   const handleDrop = async (e, targetStageId) => {
     e.preventDefault()
     const customerId = e.dataTransfer.getData('text/plain')
-    if (!customerId || customerId === dragStageId) return
+    // 同列投放不调用 API（原 bug：拿 customerId 和 stageId 比较，永远不成立）
+    if (!customerId || dragStageId === targetStageId) return
 
     try {
       await api.updateCustomer(customerId, { stage: targetStageId })

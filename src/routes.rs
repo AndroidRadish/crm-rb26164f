@@ -73,5 +73,6 @@ pub fn router() -> Router<PgPool> {
             "/export/customers.csv",
             get(handlers::import::export_customers_csv),
         )
+        .route("/settings", get(handlers::settings::get_settings).put(handlers::settings::put_settings))
         .route("/dashboard", get(handlers::pipeline::dashboard))
 }

@@ -61,18 +61,25 @@ pub async fn send_dingtalk(webhook_url: &str, title: &str, content: &str) -> any
 }
 
 /// 根据 reminder_channel 发送提醒
-pub async fn send_reminder(channel: &str, title: &str, content: &str) -> anyhow::Result<()> {
+pub async fn send_reminder(
+    pool: &sqlx::PgPool,
+    tenant_id: uuid::Uuid,
+    channel: &str,
+    title: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let key = match channel {
+        "wecom" => "wecom_webhook_url",
+        "dingtalk" => "dingtalk_webhook_url",
+        _ => return Ok(()), // system 渠道在系统内提醒，无需 webhook
+    };
+    // DB 设置优先，环境变量兜底
+    let url = crate::handlers::settings::get_setting(pool, tenant_id, key)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("{key} 未配置（后台 设置 页或环境变量）"))?;
     match channel {
-        "wecom" => {
-            let url = std::env::var("WECOM_WEBHOOK_URL")
-                .map_err(|_| anyhow::anyhow!("WECOM_WEBHOOK_URL not configured"))?;
-            send_wecom(&url, title, content).await
-        }
-        "dingtalk" => {
-            let url = std::env::var("DINGTALK_WEBHOOK_URL")
-                .map_err(|_| anyhow::anyhow!("DINGTALK_WEBHOOK_URL not configured"))?;
-            send_dingtalk(&url, title, content).await
-        }
-        _ => Ok(()), // system 渠道在系统内提醒，无需 webhook
+        "wecom" => send_wecom(&url, title, content).await,
+        "dingtalk" => send_dingtalk(&url, title, content).await,
+        _ => Ok(()),
     }
 }

@@ -96,7 +96,42 @@ export default function Dashboard() {
             </div>
           </div>
         )}
+
+        <WebhookSettings />
       </Page>
+    </div>
+  )
+}
+
+function WebhookSettings() {
+  const [form, setForm] = useState({ wecom_webhook_url: '', dingtalk_webhook_url: '' })
+  const [msg, setMsg] = useState('')
+
+  useEffect(() => {
+    api.getSettings().then(d => setForm(f => ({ ...f, ...d }))).catch(() => {})
+  }, [])
+
+  const save = async () => {
+    setMsg('')
+    try {
+      await api.putSettings(form)
+      setMsg('已保存，企微/钉钉提醒已生效')
+    } catch (e) { setMsg(e.message) }
+  }
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div className="card-title">提醒设置（企微/钉钉 webhook）</div>
+      <div className="form-group" style={{ marginTop: 12 }}>
+        <label className="form-label">企业微信机器人 webhook</label>
+        <input value={form.wecom_webhook_url} onChange={(e) => setForm({ ...form, wecom_webhook_url: e.target.value })} placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+      </div>
+      <div className="form-group">
+        <label className="form-label">钉钉机器人 webhook</label>
+        <input value={form.dingtalk_webhook_url} onChange={(e) => setForm({ ...form, dingtalk_webhook_url: e.target.value })} placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+      </div>
+      <button className="btn btn-primary" onClick={save}>保存</button>
+      {msg && <div className="form-hint" style={{ marginTop: 8 }}>{msg}</div>}
     </div>
   )
 }

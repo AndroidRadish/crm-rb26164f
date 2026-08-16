@@ -105,3 +105,5 @@ export const exportCustomersCsv = () =>
 // ============ audit ============
 export const listAudit = (limit = 100) =>
   api.get('/audit', { params: { limit } }).then((r) => r.data)
+export const getSettings = () => api.get('/settings').then((r) => r.data)
+export const putSettings = (data) => api.put('/settings', data).then((r) => r.data)

@@ -179,6 +179,8 @@ pub async fn create(
                 let title = task.title.clone();
                 let due = task.due_at.to_rfc3339();
                 let _ = crate::services::webhook::send_reminder(
+                    &pool,
+                    user.tenant_id,
                     channel_str,
                     &title,
                     &format!("截止时间：{}", due),

@@ -48,15 +48,10 @@ pub async fn upload(
     };
 
     let content = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Invalid UTF-8 content" })),
-            )
-                .into_response();
-        }
+        Ok(s) => Some(s),
+        Err(_) => None, // xlsx 是二进制，非 UTF-8 属正常（走 calamine 分支）
     };
+    let is_xlsx = body.starts_with(b"PK\x03\x04");
 
     // 创建批次记录
     let batch = match sqlx::query_as::<_, ImportBatch>(
@@ -80,56 +75,47 @@ pub async fn upload(
         }
     };
 
-    // 解析 CSV
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(content.as_bytes());
+    // 解析输入：xlsx（PK zip 头）走 calamine，否则按 CSV 文本
+    let rows: Vec<Vec<String>> = if is_xlsx {
+        match parse_xlsx(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("xlsx 解析失败: {e}") })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        match content {
+            Some(c) => parse_csv_rows(c),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "无法识别的文件格式（支持 .xlsx 和 UTF-8 CSV）" })),
+                )
+                    .into_response()
+            }
+        }
+    };
 
     let mut success_rows = 0i32;
     let mut failed_rows = 0i32;
     let mut total_rows = 0i32;
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
-    for (idx, record) in rdr.records().enumerate() {
+    for (idx, record) in rows.iter().enumerate() {
         total_rows += 1;
         let row_num = idx + 2; // +1 for header, +1 for 1-based
-        let record = match record {
-            Ok(r) => r,
-            Err(e) => {
-                failed_rows += 1;
-                errors.push(serde_json::json!({
-                    "row": row_num,
-                    "error": format!("CSV parse error: {}", e),
-                }));
-                continue;
-            }
-        };
-
-        let company = record.get(0).unwrap_or("").trim().to_string();
-        let contact_name = record
-            .get(1)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let phone = record
-            .get(2)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let email = record
-            .get(3)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let address = record
-            .get(4)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let notes = record
-            .get(5)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let stage_name = record
-            .get(6)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let cell = |i: usize| record.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+        let company = cell(0);
+        let contact_name = Some(cell(1)).filter(|s| !s.is_empty());
+        let phone = Some(cell(2)).filter(|s| !s.is_empty());
+        let email = Some(cell(3)).filter(|s| !s.is_empty());
+        let address = Some(cell(4)).filter(|s| !s.is_empty());
+        let notes = Some(cell(5)).filter(|s| !s.is_empty());
+        let stage_name = Some(cell(6)).filter(|s| !s.is_empty());
 
         if company.is_empty() {
             failed_rows += 1;
@@ -388,4 +374,34 @@ pub async fn export_customers_csv(
         csv_data,
     )
         .into_response()
+}
+
+// ── 文件解析（CSV / xlsx 统一为行数组） ──────────────────────
+
+fn parse_csv_rows(content: &str) -> Vec<Vec<String>> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(content.as_bytes());
+    rdr.records()
+        .filter_map(|r| r.ok())
+        .map(|r| (0..r.len()).map(|i| r.get(i).unwrap_or("").to_string()).collect())
+        .collect()
+}
+
+fn parse_xlsx(bytes: &[u8]) -> Result<Vec<Vec<String>>, String> {
+    use calamine::{open_workbook_auto_from_rs, Reader as _};
+    let mut wb = open_workbook_auto_from_rs(std::io::Cursor::new(bytes.to_vec())).map_err(|e| e.to_string())?;
+    let range = wb
+        .worksheet_range_at(0)
+        .ok_or_else(|| "xlsx 中没有工作表".to_string())?
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<Vec<String>> = range
+        .rows()
+        .map(|row| row.iter().map(|c| c.to_string()).collect())
+        .collect();
+    if !out.is_empty() {
+        out.remove(0); // 表头
+    }
+    Ok(out)
 }
