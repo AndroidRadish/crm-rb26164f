@@ -186,7 +186,11 @@ export default function Tasks() {
                       <div className="task-title" style={{ textDecoration: 'line-through', opacity: 0.6 }}>{t.title}</div>
                       <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
                     </div>
-                    <span className="badge badge-settled">已完成</span>
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <span className="badge badge-settled">已完成</span>
+                      <button className="btn btn-secondary btn-sm" onClick={() => updateStatus(t.id, 'pending')}>恢复</button>
+                      <button className="btn btn-danger btn-sm" onClick={() => remove(t.id)}>删除</button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -201,7 +205,10 @@ export default function Tasks() {
                       <div className="task-title" style={{ opacity: 0.5 }}>{t.title}</div>
                       <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
                     </div>
-                    <span className="badge badge-past">已取消</span>
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <span className="badge badge-past">已取消</span>
+                      <button className="btn btn-danger btn-sm" onClick={() => remove(t.id)}>删除</button>
+                    </div>
                   </div>
                 ))}
               </div>
