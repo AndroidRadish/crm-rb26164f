@@ -36,7 +36,11 @@ pub async fn template() -> impl IntoResponse {
         .into_response()
 }
 
-/// POST /api/import — 上传 CSV 导入客户
+/// POST /api/import — 上传 CSV/xlsx 导入客户
+///
+/// 支持两种提交方式：
+/// 1. multipart/form-data（Apifox/Postman/HTML 文件表单）——取文件部分再解析
+/// 2. 原始 body（text/csv 或直接贴 CSV 文本 / xlsx 二进制）
 pub async fn upload(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -45,6 +49,31 @@ pub async fn upload(
     let user = match auth::extract_user(&headers) {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
+    };
+
+    // 缺陷修复：multipart/form-data 上传时不能直接拿整个 body 当 CSV 解析，
+    // 否则 boundary/Content-Disposition 等信封行会被当成客户数据入库。
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let body: axum::body::Bytes = if content_type.starts_with("multipart/form-data") {
+        match extract_multipart_file(&body, &content_type) {
+            Ok(bytes) => bytes.into(),
+            Err(msg) => {
+                // 错误路径：记录日志并返回 400，禁止带病入库
+                tracing::warn!("import upload multipart 解析失败: {}", msg);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
     };
 
     let content = match std::str::from_utf8(&body) {
@@ -99,6 +128,22 @@ pub async fn upload(
             }
         }
     };
+
+    // 拒绝没有任何数据行的合法解析结果（空文件/只有表头视为可入库 0 行，
+    // 但完全解析不出内容的内容不允许静默成功）
+    if rows.is_empty() {
+        let msg = if is_xlsx {
+            "xlsx 文件为空或第一个工作表没有数据行".to_string()
+        } else {
+            "CSV 内容为空或格式不合法（未解析到任何数据行）".to_string()
+        };
+        tracing::warn!("import upload 内容校验失败: {}", msg);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
 
     let mut success_rows = 0i32;
     let mut failed_rows = 0i32;
@@ -374,6 +419,61 @@ pub async fn export_customers_csv(
         csv_data,
     )
         .into_response()
+}
+
+// ── multipart 信封解析（不引第三方依赖，手动按 boundary 拆 part） ──
+
+/// 从 Content-Type 头里取 boundary 参数，如 `multipart/form-data; boundary=----abc`
+fn parse_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"').to_string())
+    })
+}
+
+/// 截取 part 头部块中 `Content-Disposition` 的某个参数值（name / filename）
+fn disposition_param(header_block: &str, key: &str) -> Option<String> {
+    let line = header_block
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition"))?;
+    line.split(';').skip(1).find_map(|kv| {
+        let kv = kv.trim();
+        kv.strip_prefix(&format!("{}=", key))
+            .map(|v| v.trim_matches('"').to_string())
+    })
+}
+
+/// 手动拆 multipart body：找到含 filename 的 part（即文件部分）并返回其字节。
+/// 没有文件 part / 找不到 boundary 视为客户端请求非法，返回 Err 交给上层转 400。
+fn extract_multipart_file(body: &[u8], content_type: &str) -> Result<Vec<u8>, String> {
+    let boundary = parse_boundary(content_type)
+        .ok_or_else(|| "multipart 请求缺少 boundary 参数".to_string())?;
+    let delimiter = format!("--{}", boundary);
+
+    let body_str = String::from_utf8_lossy(body);
+    for part in body_str.split(&delimiter).skip(1) {
+        // 结束标记 --boundary--
+        if part.trim_start().starts_with("--") {
+            break;
+        }
+        // part 格式：\r\n头部\r\n\r\n内容\r\n
+        let part = part.strip_prefix("\r\n").unwrap_or(part);
+        let Some(split_at) = part.find("\r\n\r\n") else {
+            // 找不到头/内容分隔的 part 视为损坏，跳过
+            continue;
+        };
+        let header_block = &part[..split_at];
+        let mut content = &part[split_at + 4..];
+        // 去掉末尾 part 结束换行
+        if let Some(stripped) = content.strip_suffix("\r\n") {
+            content = stripped;
+        }
+        if disposition_param(header_block, "filename").is_some() {
+            return Ok(content.as_bytes().to_vec());
+        }
+    }
+    Err("multipart 请求中未找到文件部分（需要带 filename 的文件字段）".to_string())
 }
 
 // ── 文件解析（CSV / xlsx 统一为行数组） ──────────────────────

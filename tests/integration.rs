@@ -745,3 +745,226 @@ async fn test_import_and_export() {
         .unwrap();
     assert_eq!(resp.status(), 403);
 }
+
+/// 缺陷1修复：multipart/form-data 上传正常文件 → 只导入文件部分，信封行不入库
+#[tokio::test]
+async fn test_import_multipart_valid_file() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin14", "admin123", "admin").await;
+
+    // 手工构造 multipart/form-data body（模拟 Apifox/Postman/HTML 文件表单）
+    let boundary = "----TestBoundaryXYZ123";
+    let csv_content = "公司名,联系人,电话,邮箱,地址,备注,阶段\nmultipart公司甲,孙七,13800138007,sunqi@example.com,广州,多部分上传,线索\nmultipart公司乙,周八,13800138008,zhouba@example.com,深圳,多部分上传,意向\n";
+    let multipart_body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"customers.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--{b}--\r\n",
+        b = boundary,
+        csv = csv_content
+    );
+
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={}", boundary),
+        )
+        .body(multipart_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "multipart 合法文件应导入成功: {}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success_rows"], 2, "只应导入文件部分里的 2 行客户");
+    assert_eq!(body["failed_rows"], 0);
+
+    // 确认入库的是文件内容，而不是 boundary/Content-Disposition 信封行
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    let customers: Value = resp.json().await.unwrap();
+    let companies: Vec<&str> = customers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["company"].as_str())
+        .collect();
+    assert!(companies.contains(&"multipart公司甲"));
+    assert!(companies.contains(&"multipart公司乙"));
+    assert!(
+        !companies.iter().any(|c| c.contains("Content-Disposition")
+            || c.contains("Boundary")
+            || c.contains("text/csv")),
+        "multipart 信封行不得入库: {:?}",
+        companies
+    );
+}
+
+/// 缺陷1修复：multipart 垃圾内容（文件部分不是合法 CSV/xlsx）→ 400 且不入库
+#[tokio::test]
+async fn test_import_multipart_garbage_rejected() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin15", "admin123", "admin").await;
+
+    // 垃圾内容：整个 multipart 信封直接当 body（即修复前的复现路径）
+    // 且没有带 filename 的文件 part → 应 400
+    let boundary = "----GarbageBoundary456";
+    let garbage_body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nnot-a-file-field\r\n--{b}--\r\n",
+        b = boundary
+    );
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={}", boundary),
+        )
+        .body(garbage_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "无文件 part 的 multipart 应被拒绝");
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("文件"),
+        "应返回明确错误信息: {}",
+        body
+    );
+
+    // 垃圾内容：有文件 part 但内容解析不出任何数据行 → 也应 400
+    let garbage_body2 = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"junk.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{b}--\r\n",
+        b = boundary
+    );
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={}", boundary),
+        )
+        .body(garbage_body2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "空/垃圾文件内容应被拒绝");
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].is_string(), "应返回明确错误信息: {}", body);
+
+    // 确认垃圾内容没有入库（customers 应为空）
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    let customers: Value = resp.json().await.unwrap();
+    assert!(
+        customers.as_array().unwrap().is_empty(),
+        "垃圾 multipart 内容不得入库: {}",
+        customers
+    );
+
+    // 匿名用户无权导入
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Content-Type", "text/csv")
+        .body("公司名,联系人\n匿名公司,匿名")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// 缺陷2相关 API 守卫：POST /customers/:id/tasks 权限矩阵
+#[tokio::test]
+async fn test_task_create_role_matrix() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin16", "admin123", "admin").await;
+    let member_token = setup_user(&client, &base, "member7", "member123", "member").await;
+
+    // admin 建客户，并在该客户下建待办 → 可做
+    let customer = create_customer(&client, &base, &admin_token, "待办矩阵公司").await;
+    let customer_id = customer["id"].as_str().unwrap().to_string();
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, customer_id))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({
+            "title": "回访客户",
+            "due_at": "2026-08-20T10:00:00Z",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "admin 应能创建待办");
+    let task: Value = resp.json().await.unwrap();
+    assert_eq!(task["title"], "回访客户");
+
+    // 匿名 → 401
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, customer_id))
+        .json(&serde_json::json!({
+            "title": "匿名待办",
+            "due_at": "2026-08-20T10:00:00Z",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "匿名不能创建待办");
+
+    // member 对他人名下客户建待办 → 404（scope 隔离）
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .json(&serde_json::json!({
+            "title": "越权待办",
+            "due_at": "2026-08-20T10:00:00Z",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "member 不能在他人客户下建待办");
+
+    // member 在自己客户下建待办 → 可做（证明不是一刀切）
+    let own_customer = create_customer(&client, &base, &member_token, "成员自己的公司").await;
+    let own_customer_id = own_customer["id"].as_str().unwrap().to_string();
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, own_customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .json(&serde_json::json!({
+            "title": "自己的待办",
+            "due_at": "2026-08-21T09:00:00Z",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "member 应能在自己客户下建待办");
+
+    // admin 的待办列表能看到刚建的待办
+    let resp = client
+        .get(&format!("{}/api/tasks", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let tasks: Value = resp.json().await.unwrap();
+    assert!(
+        tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["title"] == "回访客户"),
+        "待办列表应包含新建待办"
+    );
+}
