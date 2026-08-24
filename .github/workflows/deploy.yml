@@ -62,6 +62,8 @@ jobs:
           ssh-keyscan -H 124.223.13.181 >> ~/.ssh/known_hosts 2>/dev/null
           SSH="ssh -o BatchMode=yes -i ~/.ssh/deploy_key root@124.223.13.181"
           SCP="scp -o BatchMode=yes -i ~/.ssh/deploy_key"
+          # 迁移文件必须随二进制同步（后端启动时全量重放）；不同步 = 新迁移不到生产（003 曾因此缺表导致 403）
+          $SCP migrations/*.sql root@124.223.13.181:/opt/crm-rb26164f/migrations/
           $SSH "docker stop crm_rb26164f_backend"
           $SCP target/x86_64-unknown-linux-musl/release/crm-rb26164f root@124.223.13.181:/opt/crm-rb26164f/bin/crm-rb26164f
           $SSH "rm -rf /opt/crm-rb26164f/frontend/*"
