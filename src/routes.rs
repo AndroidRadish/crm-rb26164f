@@ -75,4 +75,11 @@ pub fn router() -> Router<PgPool> {
         )
         .route("/settings", get(handlers::settings::get_settings).put(handlers::settings::put_settings))
         .route("/dashboard", get(handlers::pipeline::dashboard))
+        .route("/entitlements", get(handlers::entitlements::list_mine))
+        .route("/admin/tenants", get(handlers::entitlements::admin_list_tenants))
+        .route(
+            "/admin/tenants/:id/entitlements",
+            get(handlers::entitlements::admin_get_entitlements)
+                .put(handlers::entitlements::admin_put_entitlements),
+        )
 }

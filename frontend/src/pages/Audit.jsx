@@ -10,7 +10,7 @@ const navItems = [
   { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
   { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
   { to: '/stages', icon: 'stages', label: '销售阶段', end: false },
-  { to: '/import', icon: 'import', label: '数据导入', end: false },
+  { to: '/import', icon: 'import', label: '数据导入', end: false, feature: 'import.export' },
   { to: '/users', icon: 'users', label: '成员管理', end: false },
   { to: '/audit', icon: 'audit', label: '审计日志', end: false },
 ]

@@ -14,6 +14,9 @@ pub fn get_pool() -> PgPool {
 }
 
 pub async fn init_db(database_url: &str) -> anyhow::Result<PgPool> {
+    // 每次调用新建连接池并返回：调用方（含测试）持有自己的池，避免跨 tokio runtime
+    // 复用池导致获取到失效连接（集成测试曾因此 pool timed out）。
+    // 全局槽位只记录首个池，供 db::get_pool() 在进程内共享（如 main/seed）。
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(database_url)
@@ -23,9 +26,7 @@ pub async fn init_db(database_url: &str) -> anyhow::Result<PgPool> {
     run_migrations(&pool).await?;
 
     let mut guard = POOL.lock().unwrap();
-    if guard.is_some() {
-        tracing::info!("Database pool already initialized, reusing");
-    } else {
+    if guard.is_none() {
         *guard = Some(pool.clone());
     }
 

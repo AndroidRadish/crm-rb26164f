@@ -32,6 +32,7 @@ async fn clean_db(pool: &sqlx::PgPool) {
         .ok();
     sqlx::query("DELETE FROM stages").execute(pool).await.ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
+    sqlx::query("DELETE FROM entitlements").execute(pool).await.ok();
     sqlx::query("DELETE FROM tenants").execute(pool).await.ok();
 }
 
@@ -55,6 +56,9 @@ async fn ensure_tenant(pool: &sqlx::PgPool) -> uuid::Uuid {
 
 /// 启动测试服务器
 async fn start_server() -> String {
+    // owner 管理端令牌（测试环境固定值；生产由部署环境变量注入）
+    std::env::set_var("OWNER_TOKEN", "test-owner-token");
+
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test".to_string()
     });
@@ -967,4 +971,504 @@ async fn test_task_create_role_matrix() {
             .any(|t| t["title"] == "回访客户"),
         "待办列表应包含新建待办"
     );
+}
+
+
+// ── 功能分级（entitlement 层打样）──────────────────────────────
+// spec: RadishCode/planning/req-crm-tiering-spec.md
+// 矩阵：有/无授权 × admin/member × 能/不能；存量补种断言；owner 配置端点
+
+const OWNER_TOKEN: &str = "test-owner-token";
+
+/// 新建一个连接池。每个 #[tokio::test] 有自己的 runtime，池必须在当前 runtime 创建；
+/// 复用先前测试留下的全局池会拿到失效连接（pool timed out 的教训）。
+/// 注意：init_db 会重放迁移（幂等），调用时机影响迁移补种覆盖的租户集合。
+async fn test_pool() -> sqlx::PgPool {
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test".to_string()
+    });
+    crm_rb26164f::db::init_db(&database_url)
+        .await
+        .expect("pool init")
+}
+
+/// 取当前测试租户 id
+async fn current_tenant_id() -> uuid::Uuid {
+    let pool = test_pool().await;
+    sqlx::query_scalar("SELECT id FROM tenants ORDER BY created_at LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("tenant")
+}
+
+/// owner API：配置某租户的功能包
+async fn owner_put_features(
+    client: &Client,
+    base: &str,
+    tenant_id: uuid::Uuid,
+    changes: serde_json::Value,
+) -> reqwest::Response {
+    client
+        .put(&format!(
+            "{}/api/admin/tenants/{}/entitlements",
+            base, tenant_id
+        ))
+        .header("Authorization", format!("Bearer {}", OWNER_TOKEN))
+        .json(&changes)
+        .send()
+        .await
+        .expect("owner put entitlements")
+}
+
+/// 缺省规则：新租户（无 entitlements 记录）按 feature_keys.tier 默认档
+/// 基础档（crm.*）默认开，专业/旗舰档（pool.claim 等）默认关 —— 正负成对
+#[tokio::test]
+async fn test_entitlements_default_tier_rule() {
+    let base = start_server().await;
+    let client = Client::new();
+
+    // 直接建租户+用户（不走 init_db，避免触发迁移重放补种），验证"表无记录按默认档"
+    let pool = test_pool().await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (name, code) VALUES ('默认档租户', 'tier-default') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert tenant");
+    let hash = bcrypt::hash("member123", 8).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (tenant_id, username, password_hash, role) VALUES ($1, 't2member', $2, 'member')",
+    )
+    .bind(tenant_id)
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+
+    let resp = client
+        .post(&format!("{}/api/auth/login", base))
+        .json(&serde_json::json!({ "username": "t2member", "password": "member123" }))
+        .send()
+        .await
+        .expect("login");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // 授权清单：默认档计算后结果
+    let resp = client
+        .get(&format!("{}/api/entitlements", base))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let list: Value = resp.json().await.unwrap();
+    let arr = list.as_array().unwrap();
+    let get = |key: &str| arr.iter().find(|e| e["key"] == key).cloned().expect(key);
+
+    // 正：基础档默认开
+    assert_eq!(get("crm.customers")["enabled"], true);
+    assert_eq!(get("crm.customers")["source"], "default");
+    assert_eq!(get("crm.audit")["enabled"], true);
+    // 负：专业/旗舰档默认关
+    assert_eq!(get("pool.claim")["enabled"], false);
+    assert_eq!(get("import.export")["enabled"], false);
+    assert_eq!(get("notify.webhook")["enabled"], false);
+
+    // 负：无授权调用认领端点 → 403 且带 feature key
+    let resp = client
+        .post(&format!(
+            "{}/api/customers/{}/claim",
+            base,
+            uuid::Uuid::new_v4()
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "pool.claim");
+    assert!(
+        body["error"].as_str().unwrap().contains("当前版本不含此功能"),
+        "403 必须带升级提示: {}",
+        body
+    );
+}
+
+/// 存量兼容：迁移对现有租户补种 3 个分级功能 enabled=true（防老客户功能消失）
+#[tokio::test]
+async fn test_entitlement_backfill_on_migration() {
+    let base = start_server().await;
+    let _ = &base;
+
+    // start_server 内已跑过一轮迁移（当时库为空）。现在插入一个"存量租户"，
+    // 再显式重放迁移（迁移器每次启动全量重放），断言补种生效。
+    let pool = test_pool().await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (name, code) VALUES ('存量租户', 'legacy') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert legacy tenant");
+
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test".to_string()
+    });
+    crm_rb26164f::db::init_db(&database_url)
+        .await
+        .expect("re-run migrations");
+
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT feature_key, enabled FROM entitlements \
+         WHERE scope = 'tenant' AND scope_id = $1 ORDER BY feature_key",
+    )
+    .bind(tenant_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("query entitlements");
+    assert_eq!(rows.len(), 3, "存量租户应补种 3 个分级功能: {:?}", rows);
+    for (key, enabled) in &rows {
+        assert!(enabled, "补种应为 enabled=true: {}", key);
+        assert!(
+            ["import.export", "notify.webhook", "pool.claim"].contains(&key.as_str()),
+            "补种键应在打样范围内: {}",
+            key
+        );
+    }
+
+    // 幂等断言：把 pool.claim 关掉后重放迁移，不得覆盖显式记录
+    sqlx::query(
+        "UPDATE entitlements SET enabled = false WHERE scope = 'tenant' AND scope_id = $1 AND feature_key = 'pool.claim'",
+    )
+    .bind(tenant_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("disable pool.claim");
+    crm_rb26164f::db::init_db(&database_url)
+        .await
+        .expect("re-run migrations again");
+    let enabled: bool = sqlx::query_scalar(
+        "SELECT enabled FROM entitlements WHERE scope = 'tenant' AND scope_id = $1 AND feature_key = 'pool.claim'",
+    )
+    .bind(tenant_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query pool.claim");
+    assert!(!enabled, "迁移重放不得覆盖 owner 显式关掉的授权");
+}
+
+/// pool.claim 矩阵：有/无授权 × admin/member × 能/不能 + owner 关闭/恢复全流程
+#[tokio::test]
+async fn test_pool_claim_feature_matrix() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin20", "admin123", "admin").await;
+    let member_token = setup_user(&client, &base, "member20", "member123", "member").await;
+    // setup_user 触发了迁移重放 → 当前租户已补种 pool.claim=true（存量全开）
+    let tenant_id = current_tenant_id().await;
+
+    // 准备一个公海客户
+    let pool = test_pool().await;
+    let customer_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO customers (tenant_id, company, contact_name, owner_id, source) \
+         VALUES ($1, '分级矩阵公司', '联系人', NULL, 'manual') RETURNING id",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert pool customer");
+
+    // 正：有授权 member 认领 → 能
+    let resp = client
+        .post(&format!("{}/api/customers/{}/claim", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 member 应能认领");
+
+    // 正：有授权 member 释放 → 能
+    let resp = client
+        .post(&format!("{}/api/customers/{}/release", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 member 应能释放");
+
+    // owner 端点负矩阵：无 token → 403；租户 admin token → 403（不得自改授权）
+    let resp = client
+        .put(&format!(
+            "{}/api/admin/tenants/{}/entitlements",
+            base, tenant_id
+        ))
+        .json(&serde_json::json!({ "pool.claim": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无 owner token 不得配置功能包");
+    let resp = client
+        .put(&format!(
+            "{}/api/admin/tenants/{}/entitlements",
+            base, tenant_id
+        ))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({ "pool.claim": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "租户 admin 不得自改授权");
+
+    // owner 关掉 pool.claim
+    let resp = owner_put_features(&client, &base, tenant_id, serde_json::json!({ "pool.claim": false })).await;
+    assert!(resp.status().is_success(), "owner 关闭应成功: {}", resp.status());
+    let list: Value = resp.json().await.unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "pool.claim")
+        .unwrap()
+        .clone();
+    assert_eq!(entry["enabled"], false);
+    assert_eq!(entry["source"], "entitlement");
+
+    // 负：无授权 member 认领 → 403 带 feature key
+    let resp = client
+        .post(&format!("{}/api/customers/{}/claim", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 member 不得认领");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "pool.claim");
+
+    // 负：无授权 admin 认领 → 403（分级与角色正交，admin 也不豁免）
+    let resp = client
+        .post(&format!("{}/api/customers/{}/claim", base, customer_id))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 admin 不得认领");
+
+    // 负：无授权 member 释放 → 403（先让 member 名下有客户：直接 SQL 指定 owner）
+    let member_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM users WHERE tenant_id = $1 AND username = 'member20'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("member id");
+    sqlx::query("UPDATE customers SET owner_id = $1 WHERE id = $2")
+        .bind(member_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("assign owner");
+    let resp = client
+        .post(&format!("{}/api/customers/{}/release", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 member 不得释放");
+
+    // 租户侧清单也反映关闭结果
+    let resp = client
+        .get(&format!("{}/api/entitlements", base))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    let list: Value = resp.json().await.unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "pool.claim")
+        .unwrap()
+        .clone();
+    assert_eq!(entry["enabled"], false);
+
+    // owner 再开回来 → 恢复
+    let resp = owner_put_features(&client, &base, tenant_id, serde_json::json!({ "pool.claim": true })).await;
+    assert!(resp.status().is_success());
+    sqlx::query("UPDATE customers SET owner_id = NULL WHERE id = $1")
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("back to pool");
+    let resp = client
+        .post(&format!("{}/api/customers/{}/claim", base, customer_id))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "恢复授权后 member 应能再次认领");
+
+    // 审计：两次 entitlement.update 均入日志
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE tenant_id = $1 AND action = 'entitlement.update'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("audit count");
+    assert!(audit_count >= 2, "功能包变更应进审计日志, got {}", audit_count);
+}
+
+/// import.export 矩阵：有/无授权 × admin/member × 能/不能
+#[tokio::test]
+async fn test_import_export_feature_matrix() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin21", "admin123", "admin").await;
+    let member_token = setup_user(&client, &base, "member21", "member123", "member").await;
+    let tenant_id = current_tenant_id().await;
+
+    let csv_data = "公司名,联系人\n分级导入公司,钱九";
+
+    // 正：有授权 admin 导入 → 能
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header("Content-Type", "text/csv")
+        .body(csv_data.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 admin 应能导入");
+
+    // 正：有授权 admin 导出 → 能
+    let resp = client
+        .get(&format!("{}/api/export/customers.csv", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 admin 应能导出");
+
+    // owner 关掉 import.export
+    let resp =
+        owner_put_features(&client, &base, tenant_id, serde_json::json!({ "import.export": false })).await;
+    assert!(resp.status().is_success());
+
+    // 负：无授权 admin 导入 → 403 带 feature key
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header("Content-Type", "text/csv")
+        .body(csv_data.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 admin 不得导入");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "import.export");
+
+    // 负：无授权 member 导入 → 403
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .header("Content-Type", "text/csv")
+        .body(csv_data.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 member 不得导入");
+
+    // 负：无授权 admin 导出 → 403
+    let resp = client
+        .get(&format!("{}/api/export/customers.csv", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 admin 不得导出");
+
+    // 恢复：owner 开回来 → admin 导出 200
+    let resp =
+        owner_put_features(&client, &base, tenant_id, serde_json::json!({ "import.export": true })).await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/export/customers.csv", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "恢复授权后 admin 应能导出");
+}
+
+/// notify.webhook 矩阵：有/无授权 × admin/member × 能/不能
+#[tokio::test]
+async fn test_notify_webhook_feature_matrix() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_token = setup_user(&client, &base, "admin22", "admin123", "admin").await;
+    let member_token = setup_user(&client, &base, "member22", "member123", "member").await;
+    let tenant_id = current_tenant_id().await;
+
+    // 正：有授权 admin 保存 webhook 设置 → 能
+    let resp = client
+        .put(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({ "wecom_webhook_url": "https://example.com/hook" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 admin 应能保存 webhook 设置");
+
+    // owner 关掉 notify.webhook
+    let resp =
+        owner_put_features(&client, &base, tenant_id, serde_json::json!({ "notify.webhook": false })).await;
+    assert!(resp.status().is_success());
+
+    // 负：无授权 admin 保存 → 403 带 feature key
+    let resp = client
+        .put(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({ "wecom_webhook_url": "https://example.com/hook2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "无授权 admin 不得保存 webhook 设置");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "notify.webhook");
+
+    // 负：member 保存 → 403（角色守卫在先，维持既有行为）
+    let resp = client
+        .put(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", member_token))
+        .json(&serde_json::json!({ "wecom_webhook_url": "https://example.com/hook3" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "member 不得改设置（角色守卫）");
+
+    // 恢复：owner 开回来 → admin 保存 200
+    let resp =
+        owner_put_features(&client, &base, tenant_id, serde_json::json!({ "notify.webhook": true })).await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .put(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({ "wecom_webhook_url": "https://example.com/hook4" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "恢复授权后 admin 应能保存");
+
+    // 未登记键负测试：owner 配置天书键 → 400
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "not.registered": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400, "未登记的功能键必须拒绝（登记纪律）");
 }

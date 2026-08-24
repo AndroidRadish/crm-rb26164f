@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use sqlx::PgPool;
 
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature};
 
 /// 允许的配置键白名单（防止乱写）
 const KEYS: &[&str] = &["wecom_webhook_url", "dingtalk_webhook_url"];
@@ -45,6 +45,10 @@ pub async fn put_settings(
     };
     if !auth::is_admin(&user) {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "仅管理员可改设置"}))).into_response();
+    }
+    // 功能分级：企微/钉钉提醒设置属旗舰档（notify.webhook）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "notify.webhook").await {
+        return resp;
     }
     let Some(obj) = body.as_object() else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "需要 JSON 对象"}))).into_response();

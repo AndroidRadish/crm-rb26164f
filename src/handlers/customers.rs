@@ -14,7 +14,7 @@ use crate::models::customer::{
     CreateCustomerRequest, Customer, DuplicateCheckResult, UpdateCustomerRequest,
 };
 use crate::models::user::UserRole;
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature};
 
 #[derive(Debug, Deserialize)]
 pub struct CustomerQuery {
@@ -444,6 +444,10 @@ pub async fn claim(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：公海认领/释放属专业档（pool.claim）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "pool.claim").await {
+        return resp;
+    }
 
     // 只能认领公海客户（owner_id IS NULL）
     let result = sqlx::query_as::<_, Customer>(
@@ -493,6 +497,10 @@ pub async fn release(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：公海认领/释放属专业档（pool.claim）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "pool.claim").await {
+        return resp;
+    }
 
     // 只能释放自己名下的客户
     let result = sqlx::query_as::<_, Customer>(

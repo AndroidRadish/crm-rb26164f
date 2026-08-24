@@ -10,7 +10,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::models::import_batch::ImportBatch;
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature};
 
 fn unauthorized() -> impl IntoResponse {
     (
@@ -50,6 +50,10 @@ pub async fn upload(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：导入/导出属专业档（import.export）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "import.export").await {
+        return resp;
+    }
 
     // 缺陷修复：multipart/form-data 上传时不能直接拿整个 body 当 CSV 解析，
     // 否则 boundary/Content-Disposition 等信封行会被当成客户数据入库。
@@ -330,6 +334,10 @@ pub async fn export_customers_csv(
             Json(serde_json::json!({ "error": "Only admin can export data" })),
         )
             .into_response();
+    }
+    // 功能分级：导入/导出属专业档（import.export）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "import.export").await {
+        return resp;
     }
 
     let scope = auth::scope_where(&user, "c");

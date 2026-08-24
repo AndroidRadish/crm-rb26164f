@@ -10,6 +10,7 @@ import Stages from './pages/Stages'
 import Import from './pages/Import'
 import Users from './pages/Users'
 import Audit from './pages/Audit'
+import Owner from './pages/Owner'
 
 function RequireAuth({ children }) {
   const { user } = useAuth()
@@ -35,6 +36,9 @@ export default function App() {
     <Routes>
       <Route path="/" element={<HomeRedirect />} />
       <Route path="/auth/login" element={<Login />} />
+
+      {/* 工作室管理终端（owner 令牌，不走 CRM 登录） */}
+      <Route path="/owner" element={<Owner />} />
 
       {/* 通用页面（admin + member） */}
       <Route path="/customers" element={<RequireAuth><Customers /></RequireAuth>} />

@@ -15,7 +15,8 @@ const navItems = [
 
 export default function Kanban() {
   const navigate = useNavigate()
-  const { user } = useAuth()
+  const { user, hasFeature } = useAuth()
+  const canPool = hasFeature('pool.claim')
   const [columns, setColumns] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -171,21 +172,25 @@ export default function Kanban() {
                       </div>
                       <div className="kanban-card-actions">
                         {!c.owner_id ? (
-                          <button
-                            className="btn btn-sm btn-primary"
-                            disabled={busyId === c.id}
-                            onClick={(e) => handleClaim(e, c.id)}
-                          >
-                            {busyId === c.id ? '认领中…' : '加入手头'}
-                          </button>
+                          canPool && (
+                            <button
+                              className="btn btn-sm btn-primary"
+                              disabled={busyId === c.id}
+                              onClick={(e) => handleClaim(e, c.id)}
+                            >
+                              {busyId === c.id ? '认领中…' : '加入手头'}
+                            </button>
+                          )
                         ) : isMine(c.owner_id) ? (
-                          <button
-                            className="btn btn-sm btn-ghost"
-                            disabled={busyId === c.id}
-                            onClick={(e) => handleRelease(e, c.id)}
-                          >
-                            {busyId === c.id ? '释放中…' : '释放回公海'}
-                          </button>
+                          canPool && (
+                            <button
+                              className="btn btn-sm btn-ghost"
+                              disabled={busyId === c.id}
+                              onClick={(e) => handleRelease(e, c.id)}
+                            >
+                              {busyId === c.id ? '释放中…' : '释放回公海'}
+                            </button>
+                          )
                         ) : null}
                       </div>
                     </div>

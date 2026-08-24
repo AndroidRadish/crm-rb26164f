@@ -38,12 +38,14 @@ const icons = {
 let setSidebarOpenGlobal = null
 
 export function Sidebar({ navItems }) {
-  const { logout, user } = useAuth()
+  const { logout, user, hasFeature } = useAuth()
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   setSidebarOpenGlobal = setOpen
 
   const close = () => setOpen(false)
+  // 功能分级：带 feature 标记的导航项在无授权时隐藏入口
+  const visibleItems = navItems.filter((item) => !item.feature || hasFeature(item.feature))
 
   return (
     <>
@@ -53,7 +55,7 @@ export function Sidebar({ navItems }) {
           <span className="dot">●</span> CRM
         </div>
         <nav className="sidebar-nav">
-          {navItems.map((item) => (
+          {visibleItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

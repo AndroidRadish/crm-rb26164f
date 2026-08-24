@@ -14,7 +14,8 @@ const navItems = [
 ]
 
 export default function Customers() {
-  const { user, isAdmin } = useAuth()
+  const { user, hasFeature } = useAuth()
+  const canPool = hasFeature('pool.claim')
   const navigate = useNavigate()
   const [customers, setCustomers] = useState([])
   const [stages, setStages] = useState([])
@@ -222,10 +223,10 @@ export default function Customers() {
                     <td>{c.owner_id ? (c.owner_id === user?.id ? '我' : '他人') : '公海'}</td>
                     <td>{fmtDate(c.updated_at)}</td>
                     <td onClick={(e) => e.stopPropagation()}>
-                      {!c.owner_id && (
+                      {!c.owner_id && canPool && (
                         <button className="btn btn-secondary btn-sm" onClick={() => claim(c.id)}>认领</button>
                       )}
-                      {c.owner_id === user?.id && (
+                      {c.owner_id === user?.id && canPool && (
                         <button className="btn btn-ghost btn-sm" onClick={() => release(c.id)}>释放</button>
                       )}
                     </td>

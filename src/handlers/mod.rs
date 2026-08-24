@@ -2,6 +2,7 @@ pub mod activities;
 pub mod audit;
 pub mod auth;
 pub mod customers;
+pub mod entitlements;
 pub mod health;
 pub mod import;
 pub mod pipeline;

@@ -3,6 +3,7 @@ import * as api from '../api'
 import { Page, Sidebar } from '../components/Layout'
 import { CardSkeleton } from '../components/ui'
 import { getErrorMessage } from '../api/client'
+import FeatureGate from '../components/FeatureGate'
 
 const navItems = [
   { to: '/customers', icon: 'customers', label: '客户库', end: false },
@@ -97,7 +98,9 @@ export default function Dashboard() {
           </div>
         )}
 
-        <WebhookSettings />
+        <FeatureGate feature="notify.webhook">
+          <WebhookSettings />
+        </FeatureGate>
       </Page>
     </div>
   )
@@ -116,7 +119,7 @@ function WebhookSettings() {
     try {
       await api.putSettings(form)
       setMsg('已保存，企微/钉钉提醒已生效')
-    } catch (e) { setMsg(e.message) }
+    } catch (e) { setMsg(getErrorMessage(e, '保存失败')) }
   }
 
   return (

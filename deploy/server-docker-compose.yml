@@ -30,6 +30,8 @@ services:
       RUST_LOG: info
       PORT: "9092"
       MIGRATIONS_DIR: /app/migrations
+      # 工作室管理终端令牌：未配置则 owner 端点 fail-closed；生产值在服务器 compose 上覆写
+      OWNER_TOKEN: ${OWNER_TOKEN:-}
     working_dir: /app
     command: sh -c "./crm-rb26164f"
     depends_on:

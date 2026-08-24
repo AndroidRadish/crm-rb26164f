@@ -107,3 +107,6 @@ export const listAudit = (limit = 100) =>
   api.get('/audit', { params: { limit } }).then((r) => r.data)
 export const getSettings = () => api.get('/settings').then((r) => r.data)
 export const putSettings = (data) => api.put('/settings', data).then((r) => r.data)
+
+// ============ entitlements（功能分级） ============
+export const getEntitlements = () => api.get('/entitlements').then((r) => r.data)

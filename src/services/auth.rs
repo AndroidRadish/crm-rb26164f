@@ -102,6 +102,19 @@ pub fn is_admin(user: &AuthUser) -> bool {
     user.role == UserRole::Admin
 }
 
+/// 工作室管理终端（owner）鉴权：与租户角色体系正交。
+/// owner 不属于任何租户，用 OWNER_TOKEN 环境变量配置的独立令牌识别；
+/// 未配置或配置为空时一律拒绝（fail-closed），部署时必须显式开启。
+pub fn is_owner(headers: &HeaderMap) -> bool {
+    let Ok(expected) = std::env::var("OWNER_TOKEN") else {
+        return false;
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    extract_bearer_token(headers).is_some_and(|token| token == expected)
+}
+
 /// 生成数据范围过滤 SQL。
 /// admin → `tenant_id = '...'`
 /// member → `tenant_id = '...' AND <prefix>owner_id = '...'`
