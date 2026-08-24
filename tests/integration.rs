@@ -30,6 +30,9 @@ async fn clean_db(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .ok();
+    // settings 有 tenant_id FK：漏删会挡住 DELETE FROM tenants（静默 .ok()），
+    // 残留租户导致下次跑测试时固定 code（legacy/tier-default）重复键失败
+    sqlx::query("DELETE FROM settings").execute(pool).await.ok();
     sqlx::query("DELETE FROM stages").execute(pool).await.ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
     sqlx::query("DELETE FROM entitlements").execute(pool).await.ok();
