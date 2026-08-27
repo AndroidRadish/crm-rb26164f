@@ -683,15 +683,23 @@ pub async fn transfer(
         Ok(customer) => {
             // 时间线留痕：负责人变更事件（作者 = 操作人）
             let old_name = match old.owner_id {
-                Some(oid) => sqlx::query_scalar::<_, String>(
-                    "SELECT COALESCE(display_name, username) FROM users WHERE id = $1",
-                )
-                .bind(oid)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "未知".to_string()),
+                Some(oid) => {
+                    match sqlx::query_scalar::<_, String>(
+                        "SELECT COALESCE(display_name, username) FROM users WHERE id = $1",
+                    )
+                    .bind(oid)
+                    .fetch_optional(&pool)
+                    .await
+                    {
+                        Ok(Some(name)) => name,
+                        Ok(None) => "未知".to_string(),
+                        Err(e) => {
+                            // 显示名仅影响留痕文案，DB 错误降级为「未知」但不静默吞错
+                            tracing::warn!("换人留痕查旧负责人显示名失败: user={} err={}", oid, e);
+                            "未知".to_string()
+                        }
+                    }
+                }
                 None => "公海".to_string(),
             };
             let new_name = new_owner

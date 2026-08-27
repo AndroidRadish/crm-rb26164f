@@ -35,18 +35,20 @@ export default function CustomerDetail() {
   const [transferTo, setTransferTo] = useState('')
   const [transferring, setTransferring] = useState(false)
 
+  const [actsDenied, setActsDenied] = useState(false)
+  const [tasksDenied, setTasksDenied] = useState(false)
+  const [actsError, setActsError] = useState('')
+  const [tasksError, setTasksError] = useState('')
+
   const load = async () => {
     setLoading(true)
+    // 客户主档与阶段为关键数据：失败才整页报错
     try {
-      const [c, acts, ts, sts] = await Promise.all([
+      const [c, sts] = await Promise.all([
         api.getCustomer(id),
-        api.listActivities(id),
-        api.listCustomerTasks(id),
         api.listStages(),
       ])
       setCustomer(c)
-      setActivities(acts)
-      setTasks(ts)
       setStages(sts)
       setEditForm({
         company: c.company,
@@ -60,9 +62,43 @@ export default function CustomerDetail() {
       setError('')
     } catch (err) {
       setError(getErrorMessage(err, '加载客户详情失败'))
-    } finally {
       setLoading(false)
+      return
     }
+
+    // 时间线/待办独立加载：owner 关闭 crm.activities / crm.tasks 后后端 403，
+    // 只隐藏对应卡片（FeatureNotice），不拖垮整页（spec §2.6「前端隐藏入口」）
+    if (hasFeature('crm.activities')) {
+      try {
+        setActivities(await api.listActivities(id))
+        setActsDenied(false)
+        setActsError('')
+      } catch (err) {
+        if (err?.response?.status === 403) {
+          setActsDenied(true)
+        } else {
+          setActsError(getErrorMessage(err, '加载跟进记录失败'))
+        }
+      }
+    } else {
+      setActivities([])
+    }
+    if (hasFeature('crm.tasks')) {
+      try {
+        setTasks(await api.listCustomerTasks(id))
+        setTasksDenied(false)
+        setTasksError('')
+      } catch (err) {
+        if (err?.response?.status === 403) {
+          setTasksDenied(true)
+        } else {
+          setTasksError(getErrorMessage(err, '加载待办失败'))
+        }
+      }
+    } else {
+      setTasks([])
+    }
+    setLoading(false)
   }
 
   useEffect(() => { load() }, [id])
@@ -253,8 +289,8 @@ export default function CustomerDetail() {
         )}
 
         <div className="grid grid-2">
-          {/* 时间轴（功能分级 crm.activities：无授权隐藏内容，后端 403 是底线） */}
-          {hasFeature('crm.activities') ? (
+          {/* 时间轴（功能分级 crm.activities：无授权或后端 403 时隐藏卡片，不拖垮整页） */}
+          {hasFeature('crm.activities') && !actsDenied ? (
           <div className="card">
             <div className="card-title">跟进时间轴</div>
             <form onSubmit={addActivity} style={{ marginBottom: 16 }}>
@@ -278,6 +314,9 @@ export default function CustomerDetail() {
               </div>
               <button type="submit" className="btn btn-primary btn-sm">添加跟进</button>
             </form>
+            {actsError ? (
+              <div className="form-error">{actsError}</div>
+            ) : (
             <div className="timeline">
               {activities.length === 0 ? (
                 <div className="empty-state">暂无跟进记录</div>
@@ -297,12 +336,14 @@ export default function CustomerDetail() {
                 ))
               )}
             </div>
+            )}
           </div>
           ) : (
             <FeatureNotice />
           )}
 
-          {/* 待办 */}
+          {/* 待办（功能分级 crm.tasks：无授权或后端 403 时隐藏卡片，不拖垮整页） */}
+          {hasFeature('crm.tasks') && !tasksDenied ? (
           <div className="card">
             <div className="card-title">待办任务</div>
             <form onSubmit={addTask} style={{ marginBottom: 16 }}>
@@ -322,6 +363,9 @@ export default function CustomerDetail() {
               </div>
               <button type="submit" className="btn btn-primary btn-sm">创建待办</button>
             </form>
+            {tasksError ? (
+              <div className="form-error">{tasksError}</div>
+            ) : (
             <div>
               {tasks.length === 0 ? (
                 <div className="empty-state">暂无待办</div>
@@ -349,7 +393,11 @@ export default function CustomerDetail() {
                 ))
               )}
             </div>
+            )}
           </div>
+          ) : (
+            <FeatureNotice />
+          )}
         </div>
       </Page>
     </div>
