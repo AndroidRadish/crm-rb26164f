@@ -1,18 +1,13 @@
 import { useEffect, useState } from 'react'
 import * as api from '../api'
-import { Page, Sidebar } from '../components/Layout'
+import { Page, Sidebar, getNavItems } from '../components/Layout'
 import { CardSkeleton } from '../components/ui'
 import { getErrorMessage } from '../api/client'
 import FeatureGate from '../components/FeatureGate'
-
-const navItems = [
-  { to: '/customers', icon: 'customers', label: '客户库', end: false },
-  { to: '/kanban', icon: 'kanban', label: '销售看板', end: false },
-  { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
-  { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
-]
+import { useAuth } from '../auth'
 
 export default function Dashboard() {
+  const { user } = useAuth()
   const [stats, setStats] = useState(null)
   const [funnel, setFunnel] = useState([])
   const [loading, setLoading] = useState(true)
@@ -40,7 +35,7 @@ export default function Dashboard() {
 
   return (
     <div className="layout">
-      <Sidebar navItems={navItems} />
+      <Sidebar navItems={getNavItems(user)} />
       <Page>
         <h1 className="page-title">数据看板</h1>
         {error && <div className="form-error">{error}</div>}

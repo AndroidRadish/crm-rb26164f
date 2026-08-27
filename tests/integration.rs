@@ -1131,12 +1131,20 @@ async fn test_entitlement_backfill_on_migration() {
     .fetch_all(&pool)
     .await
     .expect("query entitlements");
-    assert_eq!(rows.len(), 3, "存量租户应补种 3 个分级功能: {:?}", rows);
+    // 003 补种 3 个打样键 + 004 补种 crm.reports/crm.reminders（RB-266FB3 新登记）
+    assert_eq!(rows.len(), 5, "存量租户应补种 5 个分级功能: {:?}", rows);
     for (key, enabled) in &rows {
         assert!(enabled, "补种应为 enabled=true: {}", key);
         assert!(
-            ["import.export", "notify.webhook", "pool.claim"].contains(&key.as_str()),
-            "补种键应在打样范围内: {}",
+            [
+                "crm.reminders",
+                "crm.reports",
+                "import.export",
+                "notify.webhook",
+                "pool.claim"
+            ]
+            .contains(&key.as_str()),
+            "补种键应在登记范围内: {}",
             key
         );
     }
@@ -1474,4 +1482,795 @@ async fn test_notify_webhook_feature_matrix() {
     )
     .await;
     assert_eq!(resp.status(), 400, "未登记的功能键必须拒绝（登记纪律）");
+}
+
+
+// ── RB-266FB3：CRM 完整版重做 ─────────────────────────────────
+// 状态机（合法/非法流转成对）、数据域正负矩阵、换人时间线、
+// 逾期提醒、报表口径、导入去重、导出时间线摘要、时间线 entitlement 门
+
+/// 辅助：按名字找阶段 id
+fn stage_id_by_name(stages: &Value, name: &str) -> String {
+    stages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("stage {} not found", name))
+        .id_str()
+}
+
+trait StageExt {
+    fn id_str(&self) -> String;
+}
+impl StageExt for Value {
+    fn id_str(&self) -> String {
+        self["id"].as_str().unwrap().to_string()
+    }
+}
+
+/// 辅助：PUT 客户阶段并返回响应
+async fn put_customer_stage(
+    client: &Client,
+    base: &str,
+    token: &str,
+    customer_id: &str,
+    stage_id: &str,
+) -> reqwest::Response {
+    client
+        .put(&format!("{}/api/customers/{}", base, customer_id))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "stage": stage_id }))
+        .send()
+        .await
+        .expect("put customer stage")
+}
+
+/// 2.1 状态机：合法流转放行 / 非法流转 409（后端强制）
+#[tokio::test]
+async fn test_stage_machine_transitions() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "sm_admin", "admin123", "admin").await;
+
+    // 搭一条完整链：线索(0)→意向(1)→报价(2)→赢单(10,终态)/输单(11,终态)
+    let resp = client
+        .get(&format!("{}/api/stages", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let stages: Value = resp.json().await.unwrap();
+    let lead = stage_id_by_name(&stages, "线索");
+    let won = stage_id_by_name(&stages, "赢单");
+    let lost = stage_id_by_name(&stages, "输单");
+    // 把两个终态挪到尾部，腾出中间位置
+    for (sid, order) in [(&won, 10), (&lost, 11)] {
+        let resp = client
+            .put(&format!("{}/api/stages/{}", base, sid))
+            .header("Authorization", format!("Bearer {}", admin))
+            .json(&serde_json::json!({ "order_index": order }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    let mut intent = String::new();
+    let mut quote = String::new();
+    for (name, order) in [("意向", 1), ("报价", 2)] {
+        let resp = client
+            .post(&format!("{}/api/stages", base))
+            .header("Authorization", format!("Bearer {}", admin))
+            .json(&serde_json::json!({ "name": name, "order_index": order }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let s: Value = resp.json().await.unwrap();
+        if name == "意向" {
+            intent = s.id_str();
+        } else {
+            quote = s.id_str();
+        }
+    }
+
+    // 正：初始放置（NULL → 任意活性阶段）
+    let c1 = create_customer(&client, &base, &admin, "状态机公司1").await;
+    let c1_id = c1.id_str();
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &lead).await;
+    assert_eq!(resp.status(), 200, "初始放置线索应合法");
+
+    // 正：前进一步
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &intent).await;
+    assert_eq!(resp.status(), 200, "线索→意向（前进一步）应合法");
+    // 正：再前进一步
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &quote).await;
+    assert_eq!(resp.status(), 200, "意向→报价（前进一步）应合法");
+    // 正：原地放置 no-op
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &quote).await;
+    assert_eq!(resp.status(), 200, "原地放置应合法");
+    // 负：跨格跳跃（报价→线索，跨 2 格）
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &lead).await;
+    assert_eq!(resp.status(), 409, "报价→线索跨格跳跃必须拒绝");
+    // 正：后退一步（报价→意向）
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &intent).await;
+    assert_eq!(resp.status(), 200, "报价→意向（后退一步）应合法");
+    // 负：跨格前进（意向→赢单之外的跨格已被终态规则覆盖，这里测 意向→线索+报价相邻外目标）
+    // 意向→赢单：进终态，合法
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &won).await;
+    assert_eq!(resp.status(), 200, "非终态→赢单（终态）应合法");
+    // 负：终态不可出
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &intent).await;
+    assert_eq!(resp.status(), 409, "赢单→意向（终态出）必须拒绝");
+    let resp = put_customer_stage(&client, &base, &admin, &c1_id, &lost).await;
+    assert_eq!(resp.status(), 409, "赢单→输单（终态互转）必须拒绝");
+
+    // 负：目标阶段已停用
+    let resp = client
+        .post(&format!("{}/api/stages", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "name": "休眠", "order_index": 20 }))
+        .send()
+        .await
+        .unwrap();
+    let dormant: Value = resp.json().await.unwrap();
+    let dormant_id = dormant.id_str();
+    let resp = client
+        .put(&format!("{}/api/stages/{}", base, dormant_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "is_active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let c2 = create_customer(&client, &base, &admin, "状态机公司2").await;
+    let c2_id = c2.id_str();
+    let resp = put_customer_stage(&client, &base, &admin, &c2_id, &dormant_id).await;
+    assert_eq!(resp.status(), 409, "停用阶段不可作为流转目标");
+
+    // pipeline 条目更新同样走状态机，且同步 customers.stage
+    let c3 = create_customer(&client, &base, &admin, "状态机公司3").await;
+    let c3_id = c3.id_str();
+    let resp = put_customer_stage(&client, &base, &admin, &c3_id, &intent).await;
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(&format!("{}/api/pipeline", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "customer_id": c3_id, "stage_id": intent }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let entry: Value = resp.json().await.unwrap();
+    let entry_id = entry.id_str();
+    // 正：意向→报价（相邻）
+    let resp = client
+        .put(&format!("{}/api/pipeline/{}", base, entry_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "stage_id": quote }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "pipeline 意向→报价应合法");
+    // customers.stage 已同步
+    let resp = client
+        .get(&format!("{}/api/customers/{}", base, c3_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["stage"].as_str().unwrap(), quote, "pipeline 改阶段必须同步 customers.stage");
+    // 负：报价→线索（跨格）
+    let resp = client
+        .put(&format!("{}/api/pipeline/{}", base, entry_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "stage_id": lead }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "pipeline 报价→线索跨格必须拒绝");
+}
+
+/// 2.3 数据域矩阵：销售互不可见（客户/时间线/任务 404），老板全见（200）——正负成对
+#[tokio::test]
+async fn test_role_matrix_data_domain() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "dd_admin", "admin123", "admin").await;
+    let sales_a = setup_user(&client, &base, "dd_sales_a", "member123", "member").await;
+    let sales_b = setup_user(&client, &base, "dd_sales_b", "member123", "member").await;
+
+    // 销售 A 建客户 + 跟进 + 待办
+    let ca = create_customer(&client, &base, &sales_a, "A的客户公司").await;
+    let ca_id = ca.id_str();
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_a))
+        .json(&serde_json::json!({ "type": "call", "content": "A的电话跟进" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_a))
+        .json(&serde_json::json!({ "title": "A的待办", "due_at": "2030-01-01T00:00:00Z" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // 负：销售 B 访问 A 的客户 → 404
+    let resp = client
+        .get(&format!("{}/api/customers/{}", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "销售B不得看销售A的客户");
+    // 负：销售 B 访问 A 的时间线 → 404
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "销售B不得看销售A的时间线");
+    // 负：销售 B 访问 A 的客户任务 → 404
+    let resp = client
+        .get(&format!("{}/api/customers/{}/tasks", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "销售B不得看销售A的客户任务");
+    // 负：销售 B 在 A 的客户下写跟进 → 404
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .json(&serde_json::json!({ "type": "note", "content": "越权写入" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "销售B不得在销售A的客户下写跟进");
+    // 负：销售 B 的任务列表不含 A 的待办
+    let resp = client
+        .get(&format!("{}/api/tasks", base))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    let tasks: Value = resp.json().await.unwrap();
+    assert!(
+        !tasks.as_array().unwrap().iter().any(|t| t["title"] == "A的待办"),
+        "销售B任务列表不得含销售A的待办"
+    );
+
+    // 正：老板全部可见
+    let resp = client
+        .get(&format!("{}/api/customers/{}", base, ca_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "老板应能看任一销售的客户");
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "老板应能看任一销售的时间线");
+    let acts: Value = resp.json().await.unwrap();
+    assert_eq!(acts.as_array().unwrap().len(), 1);
+    assert_eq!(
+        acts[0]["author_name"].as_str().unwrap(),
+        "dd_sales_a",
+        "时间线必须带原作者名"
+    );
+    // 正：老板任务列表全团队口径
+    let resp = client
+        .get(&format!("{}/api/tasks", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let tasks: Value = resp.json().await.unwrap();
+    let t = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"] == "A的待办")
+        .expect("老板任务列表应含全团队任务");
+    assert_eq!(t["customer_company"], "A的客户公司", "任务应带客户公司名");
+    assert_eq!(t["assignee_name"], "dd_sales_a", "任务应带负责人名");
+    // 正：销售 A 自己可见（证明不是一刀切 404）
+    let resp = client
+        .get(&format!("{}/api/customers/{}", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "销售A应能看自己的客户");
+}
+
+/// 2.2 换人：负责人变更后新负责人看到完整历史时间线，原作者可追溯
+#[tokio::test]
+async fn test_transfer_keeps_timeline() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "tf_admin", "admin123", "admin").await;
+    let sales_a = setup_user(&client, &base, "tf_sales_a", "member123", "member").await;
+    let sales_b = setup_user(&client, &base, "tf_sales_b", "member123", "member").await;
+
+    // 取销售 B 的用户 id（/auth/me）
+    let resp = client
+        .get(&format!("{}/api/auth/me", base))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    let me: Value = resp.json().await.unwrap();
+    let sales_b_id = me["id"].as_str().unwrap().to_string();
+
+    // 销售 A 建客户 + 两条跟进
+    let ca = create_customer(&client, &base, &sales_a, "换人测试公司").await;
+    let ca_id = ca.id_str();
+    for content in ["A的第一次跟进", "A的第二次跟进"] {
+        let resp = client
+            .post(&format!("{}/api/customers/{}/activities", base, ca_id))
+            .header("Authorization", format!("Bearer {}", sales_a))
+            .json(&serde_json::json!({ "type": "call", "content": content }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    // 换人前：销售 B 看不到
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "换人前销售B不得可见");
+
+    // 负：member 无权换人
+    let resp = client
+        .post(&format!("{}/api/customers/{}/transfer", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_a))
+        .json(&serde_json::json!({ "owner_id": sales_b_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "member 不得执行换人");
+
+    // 负：换给不存在的用户 → 400
+    let resp = client
+        .post(&format!("{}/api/customers/{}/transfer", base, ca_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "owner_id": uuid::Uuid::new_v4() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "换给不存在用户必须拒绝");
+
+    // 正：admin 换人 A → B
+    let resp = client
+        .post(&format!("{}/api/customers/{}/transfer", base, ca_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "owner_id": sales_b_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "admin 换人应成功");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["owner_id"].as_str().unwrap(), sales_b_id);
+
+    // 正：新负责人 B 看到完整历史时间线（含原作者名 + 交接记录）
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "新负责人应能读全部历史");
+    let acts: Value = resp.json().await.unwrap();
+    let arr = acts.as_array().unwrap();
+    assert_eq!(arr.len(), 3, "两条历史跟进 + 一条交接记录: {}", acts);
+    let contents: Vec<&str> = arr.iter().filter_map(|a| a["content"].as_str()).collect();
+    assert!(contents.contains(&"A的第一次跟进"));
+    assert!(contents.contains(&"A的第二次跟进"));
+    assert!(
+        contents.iter().any(|c| c.contains("负责人变更")),
+        "时间线必须含交接记录: {:?}",
+        contents
+    );
+    // 历史记录原作者仍是 A（可追溯）
+    let a_record = arr
+        .iter()
+        .find(|a| a["content"] == "A的第一次跟进")
+        .unwrap();
+    assert_eq!(
+        a_record["author_name"].as_str().unwrap(),
+        "tf_sales_a",
+        "换人后历史记录原作者必须保留"
+    );
+
+    // 正：新负责人可继续写跟进（接手不断档）
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_b))
+        .json(&serde_json::json!({ "type": "note", "content": "B接手后的跟进" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // 负：原负责人 A 换人后失去访问权（数据域随 owner 走）
+    let resp = client
+        .get(&format!("{}/api/customers/{}", base, ca_id))
+        .header("Authorization", format!("Bearer {}", sales_a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "原负责人换人后不得再访问");
+}
+
+/// 2.1 跟进提醒：逾期任务列表接口（口径 + entitlement 门）
+#[tokio::test]
+async fn test_overdue_tasks() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "od_admin", "admin123", "admin").await;
+    let member = setup_user(&client, &base, "od_member", "member123", "member").await;
+    let tenant_id = current_tenant_id().await;
+
+    let c = create_customer(&client, &base, &member, "逾期测试公司").await;
+    let c_id = c.id_str();
+
+    // 已过期 pending 任务
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, c_id))
+        .header("Authorization", format!("Bearer {}", member))
+        .json(&serde_json::json!({ "title": "已过期任务", "due_at": "2020-01-01T00:00:00Z" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // 未来截止任务（不应逾期）
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, c_id))
+        .header("Authorization", format!("Bearer {}", member))
+        .json(&serde_json::json!({ "title": "未来任务", "due_at": "2030-01-01T00:00:00Z" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // 已过期但已完成（不应逾期）
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, c_id))
+        .header("Authorization", format!("Bearer {}", member))
+        .json(&serde_json::json!({ "title": "已完成过期任务", "due_at": "2020-06-01T00:00:00Z" }))
+        .send()
+        .await
+        .unwrap();
+    let done_task: Value = resp.json().await.unwrap();
+    let resp = client
+        .put(&format!("{}/api/tasks/{}", base, done_task.id_str()))
+        .header("Authorization", format!("Bearer {}", member))
+        .json(&serde_json::json!({ "status": "done" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // 正：member 逾期列表只含「已过期任务」
+    let resp = client
+        .get(&format!("{}/api/tasks/overdue", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: Value = resp.json().await.unwrap();
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "逾期列表应只含过期未完成任务: {}", list);
+    assert_eq!(arr[0]["title"], "已过期任务");
+    assert_eq!(arr[0]["customer_company"], "逾期测试公司");
+
+    // 正：admin 逾期列表全团队口径（含 member 的逾期任务）
+    let resp = client
+        .get(&format!("{}/api/tasks/overdue", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let list: Value = resp.json().await.unwrap();
+    assert!(
+        list.as_array().unwrap().iter().any(|t| t["title"] == "已过期任务"),
+        "老板逾期列表应含全团队逾期任务"
+    );
+
+    // entitlement：owner 关掉 crm.reminders → 403 带 feature；开回 → 200
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.reminders": false }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/tasks/overdue", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "crm.reminders 关闭后逾期接口必须 403");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "crm.reminders");
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.reminders": true }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/tasks/overdue", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "恢复授权后逾期接口应可用");
+}
+
+/// 2.4 报表：口径断言（本月新增/成交率）+ 角色口径 + entitlement 门
+#[tokio::test]
+async fn test_reports_summary() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "rp_admin", "admin123", "admin").await;
+    let member = setup_user(&client, &base, "rp_member", "member123", "member").await;
+    let tenant_id = current_tenant_id().await;
+
+    let resp = client
+        .get(&format!("{}/api/stages", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let stages: Value = resp.json().await.unwrap();
+    let lead = stage_id_by_name(&stages, "线索");
+    let won = stage_id_by_name(&stages, "赢单");
+
+    // member：2 个客户，1 个推进到赢单；admin：1 个客户（不推进）
+    let m1 = create_customer(&client, &base, &member, "报表成员公司1").await;
+    let m1_id = m1.id_str();
+    create_customer(&client, &base, &member, "报表成员公司2").await;
+    create_customer(&client, &base, &admin, "报表老板公司").await;
+    let resp = put_customer_stage(&client, &base, &member, &m1_id, &lead).await;
+    assert_eq!(resp.status(), 200);
+    let resp = put_customer_stage(&client, &base, &member, &m1_id, &won).await;
+    assert_eq!(resp.status(), 200);
+
+    // member 口径：只算自己
+    let resp = client
+        .get(&format!("{}/api/reports/summary", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let s: Value = resp.json().await.unwrap();
+    assert_eq!(s["month_new_customers"], 2, "member 本月新增=2: {}", s);
+    assert_eq!(s["advanced_total"], 1, "member 总推进=1: {}", s);
+    assert_eq!(s["won_count"], 1, "member 赢单=1: {}", s);
+    assert_eq!(s["win_rate"], 100.0, "member 成交率=100%: {}", s);
+
+    // admin 口径：全团队
+    let resp = client
+        .get(&format!("{}/api/reports/summary", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    let s: Value = resp.json().await.unwrap();
+    assert_eq!(s["month_new_customers"], 3, "admin 本月新增=3（全团队）: {}", s);
+    assert_eq!(s["advanced_total"], 1, "admin 总推进=1: {}", s);
+    assert_eq!(s["won_count"], 1, "admin 赢单=1: {}", s);
+
+    // entitlement：owner 关掉 crm.reports → admin/member 均 403 带 feature；开回恢复
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.reports": false }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    for (token, who) in [(&member, "member"), (&admin, "admin")] {
+        let resp = client
+            .get(&format!("{}/api/reports/summary", base))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "crm.reports 关闭后 {} 必须 403", who);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["feature"], "crm.reports");
+    }
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.reports": true }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/reports/summary", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "恢复授权后报表应可用");
+}
+
+/// 2.5 导入去重策略 + 错误行报告
+#[tokio::test]
+async fn test_import_dedup_and_error_report() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "dedup_admin", "admin123", "admin").await;
+
+    // 既有客户：公司名「既有公司」、电话 13800000001
+    let resp = client
+        .post(&format!("{}/api/customers", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "company": "既有公司", "phone": "13800000001" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // 三行：公司名重复 / 电话重复 / 全新
+    let csv_data = "公司名,联系人,电话,邮箱,地址,备注,阶段\n既有公司,张三,13999999999,,,,\n新公司但电话重复,李四,13800000001,,,,\n全新公司,王五,13800000002,,,,\n";
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .header("Content-Type", "text/csv")
+        .body(csv_data.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success_rows"], 1, "只有全新公司应导入成功: {}", body);
+    assert_eq!(body["failed_rows"], 2, "两行重复应计入失败: {}", body);
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "错误行报告应含两条: {}", body);
+    assert!(
+        errors.iter().all(|e| e["error"].as_str().unwrap().contains("重复")),
+        "重复行必须说明去重原因: {}",
+        body
+    );
+    assert!(
+        errors.iter().all(|e| e["row"].is_number()),
+        "错误行报告必须带行号: {}",
+        body
+    );
+
+    // 再次导入同一文件：三行全部重复
+    let resp = client
+        .post(&format!("{}/api/import", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .header("Content-Type", "text/csv")
+        .body(csv_data.to_string())
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success_rows"], 0, "重复导入应全部跳过: {}", body);
+    assert_eq!(body["failed_rows"], 3, "重复导入三行全部失败: {}", body);
+}
+
+/// 2.5 导出：含时间线摘要列（跟进次数/最近跟进）+ UTF-8 BOM
+#[tokio::test]
+async fn test_export_timeline_summary() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "exp_admin", "admin123", "admin").await;
+
+    let c = create_customer(&client, &base, &admin, "导出摘要公司").await;
+    let c_id = c.id_str();
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, c_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "type": "meeting", "content": "最近跟进内容XYZ" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let resp = client
+        .get(&format!("{}/api/export/customers.csv", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.starts_with('\u{feff}'), "CSV 必须带 UTF-8 BOM（Excel 兼容）");
+    assert!(text.contains("跟进次数"), "导出必须含跟进次数列: {}", text);
+    assert!(text.contains("最近跟进时间"), "导出必须含最近跟进时间列");
+    assert!(text.contains("最近跟进内容XYZ"), "导出必须含时间线摘要: {}", text);
+}
+
+/// 2.6 时间线 entitlement 接入：crm.activities 关闭后后端 403
+#[tokio::test]
+async fn test_activities_feature_gate() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "tl_admin", "admin123", "admin").await;
+    let tenant_id = current_tenant_id().await;
+
+    let c = create_customer(&client, &base, &admin, "时间线门公司").await;
+    let c_id = c.id_str();
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, c_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "type": "note", "content": "门控前跟进" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "默认（tier1 开）应能写跟进");
+
+    // owner 关掉 crm.activities → GET/POST 均 403 带 feature key
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.activities": false }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, c_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "crm.activities 关闭后读时间线必须 403");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "crm.activities");
+    let resp = client
+        .post(&format!("{}/api/customers/{}/activities", base, c_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "type": "note", "content": "门控后跟进" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "crm.activities 关闭后写跟进必须 403");
+
+    // 恢复
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.activities": true }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/customers/{}/activities", base, c_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "恢复授权后时间线应可用");
 }

@@ -1,17 +1,10 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import * as api from '../api'
-import { Page, Sidebar } from '../components/Layout'
+import { Page, Sidebar, getNavItems } from '../components/Layout'
 import { TableSkeleton } from '../components/ui'
 import { getErrorMessage } from '../api/client'
 import { useAuth } from '../auth'
-
-const navItems = [
-  { to: '/customers', icon: 'customers', label: '客户库', end: false },
-  { to: '/kanban', icon: 'kanban', label: '销售看板', end: false },
-  { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
-  { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
-]
 
 export default function Kanban() {
   const navigate = useNavigate()
@@ -127,7 +120,7 @@ export default function Kanban() {
 
   return (
     <div className="layout">
-      <Sidebar navItems={navItems} />
+      <Sidebar navItems={getNavItems(user)} />
       <Page>
         <h1 className="page-title">销售看板</h1>
         {error && <div className="form-error">{error}</div>}

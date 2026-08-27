@@ -58,3 +58,9 @@ pub struct DuplicateCheckResult {
     pub is_duplicate: bool,
     pub duplicates: Vec<Customer>,
 }
+
+/// 客户换人请求（新负责人 user id，必须同 tenant）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransferCustomerRequest {
+    pub owner_id: Uuid,
+}

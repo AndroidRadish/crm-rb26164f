@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::models::pipeline::{CreatePipelineEntryRequest, PipelineEntry};
 use crate::models::user::UserRole;
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature, lifecycle};
 
 fn unauthorized() -> impl IntoResponse {
     (
@@ -20,19 +20,24 @@ fn unauthorized() -> impl IntoResponse {
     )
 }
 
-/// GET /api/pipeline — 列出管道条目
+/// GET /api/pipeline — 列出管道条目（member 仅自己名下客户的条目）
 pub async fn list(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
     let user = match auth::extract_user(&headers) {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.kanban").await {
+        return resp;
+    }
+    let scope = auth::scope_where(&user, "c");
 
-    match sqlx::query_as::<_, PipelineEntry>(
+    match sqlx::query_as::<_, PipelineEntry>(&format!(
         "SELECT p.id, p.tenant_id, p.customer_id, p.stage_id, p.entered_at, p.exited_at, p.amount_estimate \
-         FROM pipeline_entries p WHERE p.tenant_id = $1 AND p.exited_at IS NULL \
+         FROM pipeline_entries p JOIN customers c ON c.id = p.customer_id \
+         WHERE p.exited_at IS NULL AND {} \
          ORDER BY p.entered_at DESC",
-    )
-    .bind(user.tenant_id)
+        scope
+    ))
     .fetch_all(&pool)
     .await
     {
@@ -55,6 +60,9 @@ pub async fn create(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.kanban").await {
+        return resp;
+    }
 
     // 验证客户在 scope 内
     let scope = auth::scope_where(&user, "c");
@@ -152,6 +160,39 @@ pub async fn update(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.kanban").await {
+        return resp;
+    }
+
+    // 条目所属客户必须在数据域内（member 不能改他人客户的管道条目）
+    let scope = auth::scope_where(&user, "c");
+    let entry_customer: Option<(Uuid, Option<Uuid>)> = match sqlx::query_as(&format!(
+        "SELECT p.customer_id, c.stage FROM pipeline_entries p \
+         JOIN customers c ON c.id = p.customer_id \
+         WHERE p.id = $1 AND p.tenant_id = $2 AND {}",
+        scope
+    ))
+    .bind(id)
+    .bind(user.tenant_id)
+    .fetch_optional(&pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let Some((entry_customer_id, current_stage)) = entry_customer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Pipeline entry not found or not in your scope" })),
+        )
+            .into_response();
+    };
 
     let stage_id = req.get("stage_id").and_then(|v| v.as_str());
     let amount = req.get("amount_estimate").and_then(|v| v.as_f64());
@@ -194,6 +235,35 @@ pub async fn update(
             )
                 .into_response();
         }
+
+        // 状态机：条目阶段变更 = 客户当前阶段流转，必须合法（RB-266FB3 §2.1）
+        if Some(stage_uuid) != current_stage {
+            let stages = match lifecycle::load_stages(&pool, user.tenant_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(reason) = lifecycle::validate_transition(&stages, current_stage, stage_uuid)
+            {
+                tracing::info!(
+                    "拒绝非法阶段流转(pipeline): customer={} from={:?} to={} reason={}",
+                    entry_customer_id,
+                    current_stage,
+                    stage_uuid,
+                    reason
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+        }
         sets.push(format!("stage_id = ${}", idx));
         idx += 1;
     }
@@ -233,6 +303,26 @@ pub async fn update(
 
     match q.fetch_optional(&pool).await {
         Ok(Some(entry)) => {
+            // 同步 customers.stage：客户当前阶段与管道条目保持一致（状态机单一事实源）
+            if stage_id.is_some() {
+                if let Err(e) = sqlx::query(
+                    "UPDATE customers SET stage = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3",
+                )
+                .bind(entry.stage_id)
+                .bind(entry.customer_id)
+                .bind(user.tenant_id)
+                .execute(&pool)
+                .await
+                {
+                    // 同步失败不隐瞒：条目已改，记日志暴露不一致
+                    tracing::warn!(
+                        "customers.stage 同步失败: customer={} stage={} err={}",
+                        entry.customer_id,
+                        entry.stage_id,
+                        e
+                    );
+                }
+            }
             audit::log_from_headers(
                 &pool,
                 &headers,
@@ -256,7 +346,7 @@ pub async fn update(
             .into_response(),
     }
 }
-/// DELETE /api/pipeline/:id — 删除管道条目
+/// DELETE /api/pipeline/:id — 删除管道条目（member 仅自己名下客户的条目）
 pub async fn delete(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -266,12 +356,20 @@ pub async fn delete(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.kanban").await {
+        return resp;
+    }
+    let scope = auth::scope_where(&user, "c");
 
-    let result = sqlx::query("DELETE FROM pipeline_entries WHERE id = $1 AND tenant_id = $2")
-        .bind(id)
-        .bind(user.tenant_id)
-        .execute(&pool)
-        .await;
+    let result = sqlx::query(&format!(
+        "DELETE FROM pipeline_entries p WHERE p.id = $1 AND p.tenant_id = $2 \
+         AND EXISTS (SELECT 1 FROM customers c WHERE c.id = p.customer_id AND {})",
+        scope
+    ))
+    .bind(id)
+    .bind(user.tenant_id)
+    .execute(&pool)
+    .await;
 
     match result {
         Ok(res) if res.rows_affected() > 0 => {
@@ -309,6 +407,10 @@ pub async fn kanban(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：销售看板属基础档（crm.kanban）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.kanban").await {
+        return resp;
+    }
 
     // 获取所有阶段
     let stages = match sqlx::query_as::<_, crate::models::stage::Stage>(
@@ -430,6 +532,10 @@ pub async fn funnel(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：销售漏斗属基础档（crm.funnel）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.funnel").await {
+        return resp;
+    }
 
     let scope = auth::scope_where(&user, "c");
 

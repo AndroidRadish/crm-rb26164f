@@ -1,4 +1,7 @@
 //! 待办任务 handler
+//!
+//! 数据域（RB-266FB3 §2.3）：admin（老板）看全团队任务，member（销售）仅自己的任务。
+//! 跟进提醒（§2.1）：GET /api/tasks/overdue 逾期任务列表，member 自己/admin 全团队口径。
 
 use axum::{
     extract::{Path, State},
@@ -6,11 +9,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::models::task::{CreateTaskRequest, Task, UpdateTaskRequest};
-use crate::services::{audit, auth};
+use crate::models::user::UserRole;
+use crate::services::{audit, auth, feature};
 
 fn unauthorized() -> impl IntoResponse {
     (
@@ -19,24 +23,100 @@ fn unauthorized() -> impl IntoResponse {
     )
 }
 
-/// GET /api/tasks — 我的待办列表
+/// 任务行 → JSON（附客户公司名与负责人名，列表/逾期共用）
+fn task_row_to_json(r: &sqlx::postgres::PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.get::<Uuid, _>("id"),
+        "tenant_id": r.get::<Uuid, _>("tenant_id"),
+        "customer_id": r.get::<Uuid, _>("customer_id"),
+        "user_id": r.get::<Uuid, _>("user_id"),
+        "title": r.get::<String, _>("title"),
+        "due_at": r.get::<chrono::DateTime<chrono::Utc>, _>("due_at"),
+        "status": r.get::<crate::models::task::TaskStatus, _>("status"),
+        "reminder_channel": r.get::<crate::models::task::ReminderChannel, _>("reminder_channel"),
+        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+        "customer_company": r.get::<Option<String>, _>("customer_company"),
+        "assignee_name": r.get::<Option<String>, _>("assignee_name"),
+    })
+}
+
+const TASK_SELECT: &str = "SELECT t.id, t.tenant_id, t.customer_id, t.user_id, t.title, t.due_at, t.status, t.reminder_channel, t.created_at, \
+     c.company AS customer_company, COALESCE(u.display_name, u.username) AS assignee_name \
+     FROM tasks t \
+     JOIN customers c ON c.id = t.customer_id \
+     LEFT JOIN users u ON u.id = t.user_id";
+
+/// GET /api/tasks — 待办列表（admin 全团队，member 仅自己）
 pub async fn list(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
     let user = match auth::extract_user(&headers) {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：待办任务属基础档（crm.tasks）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.tasks").await {
+        return resp;
+    }
 
-    match sqlx::query_as::<_, Task>(
-        "SELECT t.id, t.tenant_id, t.customer_id, t.user_id, t.title, t.due_at, t.status, t.reminder_channel, t.created_at \
-         FROM tasks t WHERE t.tenant_id = $1 AND t.user_id = $2 \
-         ORDER BY t.due_at ASC",
-    )
-    .bind(user.tenant_id)
-    .bind(user.user_id)
-    .fetch_all(&pool)
-    .await
-    {
-        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+    // 数据域过滤：admin 全团队口径，member 仅自己（spec §2.3）
+    let sql = match user.role {
+        UserRole::Admin => format!("{} WHERE t.tenant_id = $1 ORDER BY t.due_at ASC", TASK_SELECT),
+        UserRole::Member => format!(
+            "{} WHERE t.tenant_id = $1 AND t.user_id = $2 ORDER BY t.due_at ASC",
+            TASK_SELECT
+        ),
+    };
+    let mut q = sqlx::query(&sql).bind(user.tenant_id);
+    if user.role == UserRole::Member {
+        q = q.bind(user.user_id);
+    }
+
+    match q.fetch_all(&pool).await {
+        Ok(rows) => {
+            let list: Vec<_> = rows.iter().map(task_row_to_json).collect();
+            (StatusCode::OK, Json(list)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/tasks/overdue — 逾期任务列表（status=pending 且 due_at < now()）
+/// member 自己口径 / admin 全团队口径；功能分级 crm.reminders（跟进提醒）
+pub async fn overdue(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
+    let user = match auth::extract_user(&headers) {
+        Ok(u) => u,
+        Err(_) => return unauthorized().into_response(),
+    };
+    // 功能分级：跟进提醒（crm.reminders）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.reminders").await {
+        return resp;
+    }
+
+    let sql = match user.role {
+        UserRole::Admin => format!(
+            "{} WHERE t.tenant_id = $1 AND t.status = 'pending' AND t.due_at < now() \
+             ORDER BY t.due_at ASC",
+            TASK_SELECT
+        ),
+        UserRole::Member => format!(
+            "{} WHERE t.tenant_id = $1 AND t.user_id = $2 AND t.status = 'pending' AND t.due_at < now() \
+             ORDER BY t.due_at ASC",
+            TASK_SELECT
+        ),
+    };
+    let mut q = sqlx::query(&sql).bind(user.tenant_id);
+    if user.role == UserRole::Member {
+        q = q.bind(user.user_id);
+    }
+
+    match q.fetch_all(&pool).await {
+        Ok(rows) => {
+            let list: Vec<_> = rows.iter().map(task_row_to_json).collect();
+            (StatusCode::OK, Json(list)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -55,6 +135,9 @@ pub async fn list_by_customer(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.tasks").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     let exists: i64 = match sqlx::query_scalar(&format!(
@@ -112,6 +195,9 @@ pub async fn create(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.tasks").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     let exists: i64 = match sqlx::query_scalar(&format!(
@@ -198,7 +284,7 @@ pub async fn create(
     }
 }
 
-/// PUT /api/tasks/:id — 更新待办（状态/标题/截止时间）
+/// PUT /api/tasks/:id — 更新待办（admin 可改全团队，member 仅自己的）
 pub async fn update(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -209,6 +295,9 @@ pub async fn update(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.tasks").await {
+        return resp;
+    }
 
     let mut sets = Vec::new();
     let mut idx = 1;
@@ -238,13 +327,18 @@ pub async fn update(
             .into_response();
     }
 
+    // 数据域：admin 全团队可改，member 只能改自己的任务
+    let owner_clause = match user.role {
+        UserRole::Admin => String::new(),
+        UserRole::Member => format!(" AND user_id = ${}", idx + 2),
+    };
     let sql = format!(
-        "UPDATE tasks SET {} WHERE id = ${} AND tenant_id = ${} AND user_id = ${} \
+        "UPDATE tasks SET {} WHERE id = ${} AND tenant_id = ${}{} \
          RETURNING id, tenant_id, customer_id, user_id, title, due_at, status, reminder_channel, created_at",
         sets.join(", "),
         idx,
         idx + 1,
-        idx + 2
+        owner_clause
     );
 
     let mut q = sqlx::query_as::<_, Task>(&sql);
@@ -260,7 +354,10 @@ pub async fn update(
     if let Some(ref v) = req.reminder_channel {
         q = q.bind(v);
     }
-    q = q.bind(id).bind(user.tenant_id).bind(user.user_id);
+    q = q.bind(id).bind(user.tenant_id);
+    if user.role == UserRole::Member {
+        q = q.bind(user.user_id);
+    }
 
     match q.fetch_optional(&pool).await {
         Ok(Some(task)) => {
@@ -288,7 +385,7 @@ pub async fn update(
     }
 }
 
-/// DELETE /api/tasks/:id — 删除待办
+/// DELETE /api/tasks/:id — 删除待办（admin 可删全团队，member 仅自己的）
 pub async fn delete(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -298,13 +395,28 @@ pub async fn delete(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.tasks").await {
+        return resp;
+    }
 
-    let result = sqlx::query("DELETE FROM tasks WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
-        .bind(id)
-        .bind(user.tenant_id)
-        .bind(user.user_id)
-        .execute(&pool)
-        .await;
+    // 数据域：admin 全团队可删，member 只能删自己的任务
+    let result = match user.role {
+        UserRole::Admin => {
+            sqlx::query("DELETE FROM tasks WHERE id = $1 AND tenant_id = $2")
+                .bind(id)
+                .bind(user.tenant_id)
+                .execute(&pool)
+                .await
+        }
+        UserRole::Member => {
+            sqlx::query("DELETE FROM tasks WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
+                .bind(id)
+                .bind(user.tenant_id)
+                .bind(user.user_id)
+                .execute(&pool)
+                .await
+        }
+    };
 
     match result {
         Ok(res) if res.rows_affected() > 0 => {

@@ -36,6 +36,9 @@ export const claimCustomer = (id) =>
 export const releaseCustomer = (id) =>
   api.post(`/customers/${id}/release`).then((r) => r.data)
 
+export const transferCustomer = (id, ownerId) =>
+  api.post(`/customers/${id}/transfer`, { owner_id: ownerId }).then((r) => r.data)
+
 // ============ activities（时间轴） ============
 export const listActivities = (customerId) =>
   api.get(`/customers/${customerId}/activities`).then((r) => r.data)
@@ -45,6 +48,8 @@ export const createActivity = (customerId, data) =>
 
 // ============ tasks（待办） ============
 export const listTasks = () => api.get('/tasks').then((r) => r.data)
+
+export const listOverdueTasks = () => api.get('/tasks/overdue').then((r) => r.data)
 
 export const listCustomerTasks = (customerId) =>
   api.get(`/customers/${customerId}/tasks`).then((r) => r.data)
@@ -87,6 +92,9 @@ export const getKanban = () => api.get('/pipeline/kanban').then((r) => r.data)
 export const getFunnel = () => api.get('/pipeline/funnel').then((r) => r.data)
 
 export const getDashboard = () => api.get('/dashboard').then((r) => r.data)
+
+// ============ reports（报表） ============
+export const getReportsSummary = () => api.get('/reports/summary').then((r) => r.data)
 
 // ============ import/export ============
 export const getImportTemplate = () =>

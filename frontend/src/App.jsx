@@ -6,6 +6,7 @@ import CustomerDetail from './pages/CustomerDetail'
 import Kanban from './pages/Kanban'
 import Dashboard from './pages/Dashboard'
 import Tasks from './pages/Tasks'
+import Reports from './pages/Reports'
 import Stages from './pages/Stages'
 import Import from './pages/Import'
 import Users from './pages/Users'
@@ -46,6 +47,7 @@ export default function App() {
       <Route path="/kanban" element={<RequireAuth><Kanban /></RequireAuth>} />
       <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
       <Route path="/tasks" element={<RequireAuth><Tasks /></RequireAuth>} />
+      <Route path="/reports" element={<RequireAuth><Reports /></RequireAuth>} />
 
       {/* 仅 admin */}
       <Route path="/stages" element={<RequireAdmin><Stages /></RequireAdmin>} />

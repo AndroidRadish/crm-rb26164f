@@ -34,6 +34,10 @@ pub fn router() -> Router<PgPool> {
         .route("/customers/:id/claim", post(handlers::customers::claim))
         .route("/customers/:id/release", post(handlers::customers::release))
         .route(
+            "/customers/:id/transfer",
+            post(handlers::customers::transfer),
+        )
+        .route(
             "/customers/:id/activities",
             get(handlers::activities::list).post(handlers::activities::create),
         )
@@ -42,6 +46,7 @@ pub fn router() -> Router<PgPool> {
             get(handlers::tasks::list_by_customer).post(handlers::tasks::create),
         )
         .route("/tasks", get(handlers::tasks::list))
+        .route("/tasks/overdue", get(handlers::tasks::overdue))
         .route(
             "/tasks/:id",
             put(handlers::tasks::update).delete(handlers::tasks::delete),
@@ -75,6 +80,7 @@ pub fn router() -> Router<PgPool> {
         )
         .route("/settings", get(handlers::settings::get_settings).put(handlers::settings::put_settings))
         .route("/dashboard", get(handlers::pipeline::dashboard))
+        .route("/reports/summary", get(handlers::reports::summary))
         .route("/entitlements", get(handlers::entitlements::list_mine))
         .route("/admin/tenants", get(handlers::entitlements::admin_list_tenants))
         .route(

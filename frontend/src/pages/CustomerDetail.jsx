@@ -1,17 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import * as api from '../api'
-import { Page, Sidebar } from '../components/Layout'
-import { fmtDateTime, TableSkeleton } from '../components/ui'
+import { Page, Sidebar, getNavItems } from '../components/Layout'
+import { fmtDateTime, TableSkeleton, EmptyState } from '../components/ui'
 import { getErrorMessage } from '../api/client'
 import { useAuth } from '../auth'
-
-const navItems = [
-  { to: '/customers', icon: 'customers', label: '客户库', end: false },
-  { to: '/kanban', icon: 'kanban', label: '销售看板', end: false },
-  { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
-  { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
-]
+import { FeatureNotice } from '../components/FeatureGate'
 
 const ACTIVITY_TYPE_LABEL = {
   call: '📞 电话',
@@ -24,7 +18,8 @@ const ACTIVITY_TYPE_LABEL = {
 export default function CustomerDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { user } = useAuth()
+  const { user, hasFeature } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [customer, setCustomer] = useState(null)
   const [activities, setActivities] = useState([])
   const [tasks, setTasks] = useState([])
@@ -35,6 +30,10 @@ export default function CustomerDetail() {
   const [taskForm, setTaskForm] = useState({ title: '', due_at: '' })
   const [editMode, setEditMode] = useState(false)
   const [editForm, setEditForm] = useState({})
+  const [transferMode, setTransferMode] = useState(false)
+  const [teamUsers, setTeamUsers] = useState([])
+  const [transferTo, setTransferTo] = useState('')
+  const [transferring, setTransferring] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -113,6 +112,36 @@ export default function CustomerDetail() {
     }
   }
 
+  // 换人（admin）：打开面板时拉取成员列表
+  const openTransfer = async () => {
+    setTransferMode(true)
+    setTransferTo('')
+    try {
+      const users = await api.listUsers()
+      setTeamUsers(users.filter((u) => u.id !== customer?.owner_id))
+    } catch (err) {
+      setError(getErrorMessage(err, '加载成员列表失败'))
+    }
+  }
+
+  const doTransfer = async () => {
+    if (!transferTo) return
+    setTransferring(true)
+    setError('')
+    try {
+      await api.transferCustomer(id, transferTo)
+      setTransferMode(false)
+      load()
+    } catch (err) {
+      setError(getErrorMessage(err, '换人失败'))
+    } finally {
+      setTransferring(false)
+    }
+  }
+
+  // 逾期判定：pending 且截止时间已过（列表页逾期标红，spec §2.1）
+  const isOverdue = (t) => t.status === 'pending' && new Date(t.due_at) < new Date()
+
   const stageName = (sid) => {
     const s = stages.find((s) => s.id === sid)
     return s ? s.name : '—'
@@ -124,16 +153,44 @@ export default function CustomerDetail() {
 
   return (
     <div className="layout">
-      <Sidebar navItems={navItems} />
+      <Sidebar navItems={getNavItems(user)} />
       <Page>
         <button className="btn btn-ghost" onClick={() => navigate('/customers')} style={{ marginBottom: 16 }}>← 返回客户库</button>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
           <h1 className="page-title">{customer.company}</h1>
-          <button className="btn btn-secondary" onClick={() => setEditMode(!editMode)}>
-            {editMode ? '取消编辑' : '编辑'}
-          </button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {isAdmin && (
+              <button className="btn btn-secondary" onClick={() => (transferMode ? setTransferMode(false) : openTransfer())}>
+                {transferMode ? '取消换人' : '换人'}
+              </button>
+            )}
+            <button className="btn btn-secondary" onClick={() => setEditMode(!editMode)}>
+              {editMode ? '取消编辑' : '编辑'}
+            </button>
+          </div>
         </div>
+
+        {transferMode && (
+          <div className="card" style={{ marginBottom: 24, maxWidth: 600 }}>
+            <div className="card-title">负责人变更（换人）</div>
+            <p style={{ fontSize: 13, color: 'var(--color-text-secondary)', margin: '4px 0 12px' }}>
+              历史跟进时间线完整保留，新负责人可看到全部历史记录；换人会自动在时间线上留一条交接记录。
+            </p>
+            <div className="form-group">
+              <label className="form-label">新负责人 *</label>
+              <select value={transferTo} onChange={(e) => setTransferTo(e.target.value)}>
+                <option value="">请选择成员</option>
+                {teamUsers.map((u) => (
+                  <option key={u.id} value={u.id}>{u.display_name || u.username}</option>
+                ))}
+              </select>
+            </div>
+            <button className="btn btn-primary" disabled={!transferTo || transferring} onClick={doTransfer}>
+              {transferring ? '换人中…' : '确认换人'}
+            </button>
+          </div>
+        )}
 
         {editMode ? (
           <div className="card" style={{ marginBottom: 24, maxWidth: 600 }}>
@@ -196,7 +253,8 @@ export default function CustomerDetail() {
         )}
 
         <div className="grid grid-2">
-          {/* 时间轴 */}
+          {/* 时间轴（功能分级 crm.activities：无授权隐藏内容，后端 403 是底线） */}
+          {hasFeature('crm.activities') ? (
           <div className="card">
             <div className="card-title">跟进时间轴</div>
             <form onSubmit={addActivity} style={{ marginBottom: 16 }}>
@@ -230,6 +288,7 @@ export default function CustomerDetail() {
                     <div className="timeline-content">
                       <div className="timeline-header">
                         <span className="timeline-type">{ACTIVITY_TYPE_LABEL[a.type] || a.type}</span>
+                        {a.author_name && <span className="timeline-author">{a.author_name}</span>}
                         <span className="timeline-date">{fmtDateTime(a.occurred_at)}</span>
                       </div>
                       <div className="timeline-text">{a.content}</div>
@@ -239,6 +298,9 @@ export default function CustomerDetail() {
               )}
             </div>
           </div>
+          ) : (
+            <FeatureNotice />
+          )}
 
           {/* 待办 */}
           <div className="card">
@@ -265,10 +327,13 @@ export default function CustomerDetail() {
                 <div className="empty-state">暂无待办</div>
               ) : (
                 tasks.map((t) => (
-                  <div key={t.id} className="task-item">
+                  <div key={t.id} className={`task-item${isOverdue(t) ? ' task-overdue' : ''}`}>
                     <div style={{ flex: 1 }}>
                       <div className="task-title">{t.title}</div>
-                      <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
+                      <div className="task-due">
+                        截止：{fmtDateTime(t.due_at)}
+                        {isOverdue(t) && <span className="badge badge-overdue">已逾期</span>}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', gap: 4 }}>
                       {t.status === 'pending' && (

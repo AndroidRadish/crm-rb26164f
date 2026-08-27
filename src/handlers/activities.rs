@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::activity::{Activity, CreateActivityRequest};
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature};
 
 fn unauthorized() -> impl IntoResponse {
     (
@@ -29,6 +29,10 @@ pub async fn list(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：跟进记录/时间线属基础档（crm.activities）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.activities").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     // 先验证客户在 scope 内
@@ -57,9 +61,12 @@ pub async fn list(
             .into_response();
     }
 
-    match sqlx::query_as::<_, Activity>(
-        "SELECT a.id, a.tenant_id, a.customer_id, a.user_id, a.type, a.content, a.occurred_at, a.created_at \
-         FROM activities a WHERE a.customer_id = $1 AND a.tenant_id = $2 \
+    // 时间线附原作者名（author_name）：换人接手后可追溯每条记录是谁写的（spec §2.2）
+    match sqlx::query(
+        "SELECT a.id, a.tenant_id, a.customer_id, a.user_id, a.type, a.content, a.occurred_at, a.created_at, \
+         COALESCE(u.display_name, u.username) AS author_name \
+         FROM activities a LEFT JOIN users u ON u.id = a.user_id \
+         WHERE a.customer_id = $1 AND a.tenant_id = $2 \
          ORDER BY a.occurred_at DESC",
     )
     .bind(customer_id)
@@ -67,7 +74,26 @@ pub async fn list(
     .fetch_all(&pool)
     .await
     {
-        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+        Ok(rows) => {
+            use sqlx::Row;
+            let list: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.get::<Uuid, _>("id"),
+                        "tenant_id": r.get::<Uuid, _>("tenant_id"),
+                        "customer_id": r.get::<Uuid, _>("customer_id"),
+                        "user_id": r.get::<Uuid, _>("user_id"),
+                        "type": r.get::<crate::models::activity::ActivityType, _>("type"),
+                        "content": r.get::<String, _>("content"),
+                        "occurred_at": r.get::<chrono::DateTime<chrono::Utc>, _>("occurred_at"),
+                        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        "author_name": r.get::<Option<String>, _>("author_name"),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(list)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -87,6 +113,10 @@ pub async fn create(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：跟进记录/时间线属基础档（crm.activities）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.activities").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     // 验证客户在 scope 内

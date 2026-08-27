@@ -1,21 +1,12 @@
 import { useEffect, useState } from 'react'
 import * as api from '../api'
-import { Page, Sidebar } from '../components/Layout'
+import { Page, Sidebar, getNavItems } from '../components/Layout'
 import { fmtDateTime, TableSkeleton, EmptyState } from '../components/ui'
 import { getErrorMessage } from '../api/client'
-
-const navItems = [
-  { to: '/customers', icon: 'customers', label: '客户库', end: false },
-  { to: '/kanban', icon: 'kanban', label: '销售看板', end: false },
-  { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
-  { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
-  { to: '/stages', icon: 'stages', label: '销售阶段', end: false },
-  { to: '/import', icon: 'import', label: '数据导入', end: false, feature: 'import.export' },
-  { to: '/users', icon: 'users', label: '成员管理', end: false },
-  { to: '/audit', icon: 'audit', label: '审计日志', end: false },
-]
+import { useAuth } from '../auth'
 
 export default function Users() {
+  const { user } = useAuth()
   const [users, setUsers] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -61,7 +52,7 @@ export default function Users() {
 
   return (
     <div className="layout">
-      <Sidebar navItems={navItems} />
+      <Sidebar navItems={getNavItems(user)} />
       <Page>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h1 className="page-title">成员管理</h1>

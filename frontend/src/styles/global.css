@@ -225,6 +225,13 @@ table.data tbody tr:hover td { background: rgba(34, 197, 94, 0.06); }
 .badge-active { background: rgba(34, 197, 94, 0.15); color: var(--status-settled); }
 .badge-lead { background: rgba(148, 163, 184, 0.15); color: var(--color-text-secondary); }
 .badge-past { background: rgba(100, 116, 139, 0.15); color: var(--color-text-muted); }
+/* 逾期标红（RB-266FB3 §2.1 跟进提醒） */
+.badge-overdue { background: rgba(239, 68, 68, 0.15); color: #dc2626; margin-left: 8px; }
+.task-overdue { border-left: 3px solid #dc2626; padding-left: 9px; }
+.task-overdue .task-due { color: #dc2626; font-weight: 600; }
+tr.row-overdue td { background: rgba(239, 68, 68, 0.05); }
+.task-meta { font-size: 12px; color: var(--color-text-muted); margin-top: 2px; }
+.timeline-author { font-size: 12px; color: var(--color-text-secondary); font-weight: 600; }
 
 /* 表单 */
 .form-group { margin-bottom: var(--space-4); }

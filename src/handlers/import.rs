@@ -192,6 +192,43 @@ pub async fn upload(
             None
         };
 
+        // 去重策略（spec §2.5）：同 tenant 下，公司名（去空格后精确匹配）或电话（精确匹配）
+        // 与任一现有客户相同 → 视为重复行：跳过、计入 failed_rows 并写入错误行报告说明原因。
+        // 与新建防撞单（check-duplicate）的口径不同：导入是批量动作，重复行不阻断其他行。
+        let phone_norm = phone.clone().unwrap_or_default();
+        let dup_of: Option<String> = match sqlx::query_scalar::<_, String>(
+            "SELECT company FROM customers \
+             WHERE tenant_id = $1 AND duplicate_of IS NULL \
+               AND (btrim(company) = btrim($2) OR ($3 <> '' AND phone = $3)) \
+             LIMIT 1",
+        )
+        .bind(user.tenant_id)
+        .bind(&company)
+        .bind(&phone_norm)
+        .fetch_optional(&pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // 去重查询失败不带病入库：记日志并按失败行处理
+                tracing::warn!("导入去重查询失败: row={} err={}", row_num, e);
+                failed_rows += 1;
+                errors.push(serde_json::json!({
+                    "row": row_num,
+                    "error": format!("去重校验失败: {}", e),
+                }));
+                continue;
+            }
+        };
+        if let Some(existing) = dup_of {
+            failed_rows += 1;
+            errors.push(serde_json::json!({
+                "row": row_num,
+                "error": format!("重复客户（与现有「{}」公司名或电话相同），已跳过", existing),
+            }));
+            continue;
+        }
+
         // 插入客户
         let insert_result = sqlx::query(
             "INSERT INTO customers (tenant_id, company, contact_name, phone, email, address, notes, owner_id, stage, source) \
@@ -319,7 +356,10 @@ pub async fn get_batch(
     }
 }
 
-/// GET /api/export/customers.csv — 导出客户数据（管理员）
+/// GET /api/export/customers.csv — 导出客户数据（管理员，含时间线摘要）
+///
+/// 时间线摘要列（spec §2.5）：跟进次数 / 最近跟进时间 / 最近跟进内容（截断 50 字）。
+/// 带 UTF-8 BOM：Excel 直接打开中文不乱码（CSV 即 Excel 兼容格式）。
 pub async fn export_customers_csv(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -343,10 +383,18 @@ pub async fn export_customers_csv(
     let scope = auth::scope_where(&user, "c");
     let rows = match sqlx::query(&format!(
         "SELECT c.company, c.contact_name, c.phone, c.email, c.address, c.notes, \
-         s.name as stage_name, u.username as owner_name, c.created_at \
+         s.name as stage_name, COALESCE(u.display_name, u.username) as owner_name, c.created_at, \
+         COALESCE(ac.cnt, 0) as activity_count, \
+         la.occurred_at as last_activity_at, la.content as last_activity_content \
          FROM customers c \
          LEFT JOIN stages s ON c.stage = s.id \
          LEFT JOIN users u ON c.owner_id = u.id \
+         LEFT JOIN (SELECT customer_id, COUNT(*) AS cnt FROM activities GROUP BY customer_id) ac \
+           ON ac.customer_id = c.id \
+         LEFT JOIN LATERAL ( \
+           SELECT a.occurred_at, a.content FROM activities a \
+           WHERE a.customer_id = c.id ORDER BY a.occurred_at DESC LIMIT 1 \
+         ) la ON true \
          WHERE {} ORDER BY c.created_at DESC",
         scope
     ))
@@ -374,6 +422,9 @@ pub async fn export_customers_csv(
         "阶段",
         "负责人",
         "创建时间",
+        "跟进次数",
+        "最近跟进时间",
+        "最近跟进内容",
     ])
     .ok();
 
@@ -388,6 +439,15 @@ pub async fn export_customers_csv(
         let owner_name: Option<String> = row.try_get("owner_name").unwrap_or(None);
         let created_at: chrono::DateTime<chrono::Utc> =
             row.try_get("created_at").unwrap_or_default();
+        let activity_count: i64 = row.try_get("activity_count").unwrap_or(0);
+        let last_activity_at: Option<chrono::DateTime<chrono::Utc>> =
+            row.try_get("last_activity_at").unwrap_or(None);
+        let last_activity_content: Option<String> =
+            row.try_get("last_activity_content").unwrap_or(None);
+        // 摘要截断 50 字，避免单元格塞入整段长文
+        let last_summary: String = last_activity_content
+            .map(|c| c.chars().take(50).collect())
+            .unwrap_or_default();
 
         wtr.write_record([
             company,
@@ -399,11 +459,17 @@ pub async fn export_customers_csv(
             stage_name.unwrap_or_default(),
             owner_name.unwrap_or_default(),
             created_at.to_rfc3339(),
+            activity_count.to_string(),
+            last_activity_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            last_summary,
         ])
         .ok();
     }
 
     let csv_data = wtr.into_inner().unwrap_or_default();
+    // UTF-8 BOM：Excel 打开中文 CSV 需要 BOM 识别编码
+    let mut csv_with_bom = b"\xef\xbb\xbf".to_vec();
+    csv_with_bom.extend_from_slice(&csv_data);
 
     audit::log_from_headers(
         &pool,
@@ -424,7 +490,7 @@ pub async fn export_customers_csv(
                 "attachment; filename=\"customers_export.csv\"",
             ),
         ],
-        csv_data,
+        csv_with_bom,
     )
         .into_response()
 }

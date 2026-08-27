@@ -11,10 +11,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::customer::{
-    CreateCustomerRequest, Customer, DuplicateCheckResult, UpdateCustomerRequest,
+    CreateCustomerRequest, Customer, DuplicateCheckResult, TransferCustomerRequest,
+    UpdateCustomerRequest,
 };
 use crate::models::user::UserRole;
-use crate::services::{audit, auth, feature};
+use crate::services::{audit, auth, feature, lifecycle};
 
 #[derive(Debug, Deserialize)]
 pub struct CustomerQuery {
@@ -42,6 +43,10 @@ pub async fn list(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：客户库属基础档（crm.customers）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     let page = query.page.unwrap_or(1).max(1);
@@ -104,6 +109,9 @@ pub async fn create(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
 
     // 防撞单：按公司名或电话模糊匹配
     let dup_check = check_duplicate(&pool, &user, &req.company, req.phone.as_deref()).await;
@@ -174,6 +182,9 @@ pub async fn get(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     let sql = format!(
@@ -213,18 +224,21 @@ pub async fn update(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
-    // 先验证客户在 scope 内
-    let exists: i64 = match sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM customers c WHERE c.id = $1 AND {}",
+    // 先验证客户在 scope 内，同时取当前阶段（状态机流转校验要用）
+    let current_stage: Option<Option<Uuid>> = match sqlx::query_scalar(&format!(
+        "SELECT c.stage FROM customers c WHERE c.id = $1 AND {}",
         scope
     ))
     .bind(id)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
     {
-        Ok(n) => n,
+        Ok(row) => row,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -233,12 +247,43 @@ pub async fn update(
                 .into_response();
         }
     };
-    if exists == 0 {
+    let Some(current_stage) = current_stage else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Customer not found or not in your scope" })),
         )
             .into_response();
+    };
+
+    // 状态机：阶段变更必须合法（RB-266FB3 §2.1，后端强制）
+    if let Some(new_stage) = req.stage {
+        if Some(new_stage) != current_stage {
+            let stages = match lifecycle::load_stages(&pool, user.tenant_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(reason) = lifecycle::validate_transition(&stages, current_stage, new_stage)
+            {
+                tracing::info!(
+                    "拒绝非法阶段流转: customer={} from={:?} to={} reason={}",
+                    id,
+                    current_stage,
+                    new_stage,
+                    reason
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // 动态构建 UPDATE
@@ -353,6 +398,9 @@ pub async fn delete(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
     let scope = auth::scope_where(&user, "c");
 
     let sql = format!("DELETE FROM customers c WHERE c.id = $1 AND {}", scope);
@@ -532,6 +580,151 @@ pub async fn release(
             Json(serde_json::json!({ "error": "Customer not owned by you or not found" })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/customers/:id/transfer — 客户换人（负责人变更，仅 admin）
+///
+/// 换人是"老板把客户从销售 A 调给销售 B"的管理动作，与公海认领/释放（销售自助）分开。
+/// 历史时间线天然保留（activities.user_id 记录原作者）；这里再补一条系统跟进记录，
+/// 让换人事件本身也留在时间线上（新负责人接手时能看到交接点）。
+pub async fn transfer(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<TransferCustomerRequest>,
+) -> impl IntoResponse {
+    let user = match auth::extract_user(&headers) {
+        Ok(u) => u,
+        Err(_) => return unauthorized().into_response(),
+    };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
+    if !auth::is_admin(&user) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Only admin can transfer customer ownership" })),
+        )
+            .into_response();
+    }
+
+    // 新负责人必须是同 tenant 用户
+    let new_owner = sqlx::query_as::<_, crate::models::user::User>(
+        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at \
+         FROM users WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(req.owner_id)
+    .bind(user.tenant_id)
+    .fetch_optional(&pool)
+    .await;
+    let new_owner = match new_owner {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "New owner not found in your tenant" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // 更新归属（admin scope = tenant 全量）；同时取旧负责人用于时间线留痕
+    let old = sqlx::query_as::<_, Customer>(
+        "SELECT id, tenant_id, company, contact_name, phone, email, address, notes, owner_id, stage, source, duplicate_of, created_at, updated_at \
+         FROM customers WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(id)
+    .bind(user.tenant_id)
+    .fetch_optional(&pool)
+    .await;
+    let old = match old {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Customer not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let result = sqlx::query_as::<_, Customer>(
+        "UPDATE customers SET owner_id = $1, updated_at = now() \
+         WHERE id = $2 AND tenant_id = $3 \
+         RETURNING id, tenant_id, company, contact_name, phone, email, address, notes, owner_id, stage, source, duplicate_of, created_at, updated_at",
+    )
+    .bind(new_owner.id)
+    .bind(id)
+    .bind(user.tenant_id)
+    .fetch_one(&pool)
+    .await;
+
+    match result {
+        Ok(customer) => {
+            // 时间线留痕：负责人变更事件（作者 = 操作人）
+            let old_name = match old.owner_id {
+                Some(oid) => sqlx::query_scalar::<_, String>(
+                    "SELECT COALESCE(display_name, username) FROM users WHERE id = $1",
+                )
+                .bind(oid)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "未知".to_string()),
+                None => "公海".to_string(),
+            };
+            let new_name = new_owner
+                .display_name
+                .clone()
+                .unwrap_or_else(|| new_owner.username.clone());
+            let note = format!("负责人变更：{} → {}（由 {} 操作）", old_name, new_name, user.username);
+            if let Err(e) = sqlx::query(
+                "INSERT INTO activities (tenant_id, customer_id, user_id, type, content) \
+                 VALUES ($1, $2, $3, 'note', $4)",
+            )
+            .bind(user.tenant_id)
+            .bind(id)
+            .bind(user.user_id)
+            .bind(&note)
+            .execute(&pool)
+            .await
+            {
+                // 留痕失败不阻断换人主流程，但必须记日志（禁止静默吞错）
+                tracing::warn!("换人时间线留痕写入失败: customer={} err={}", id, e);
+            }
+
+            audit::log_from_headers(
+                &pool,
+                &headers,
+                "customer.transfer",
+                "customer",
+                &id.to_string(),
+                &note,
+            )
+            .await;
+            (StatusCode::OK, Json(customer)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

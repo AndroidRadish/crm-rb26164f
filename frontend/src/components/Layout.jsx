@@ -33,6 +33,30 @@ const icons = {
   menu: (
     <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
   ),
+  reports: (
+    <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 17v-6m4 6V7m4 10v-3M5 21h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+  ),
+}
+
+// 统一导航（RB-266FB3）：带 feature 标记的项在无授权时由 Sidebar 隐藏；
+// admin 专属项仅老板角色可见。各页面不再各自维护重复清单。
+export function getNavItems(user) {
+  const items = [
+    { to: '/customers', icon: 'customers', label: '客户库', end: false, feature: 'crm.customers' },
+    { to: '/kanban', icon: 'kanban', label: '销售看板', end: false, feature: 'crm.kanban' },
+    { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
+    { to: '/tasks', icon: 'tasks', label: '我的待办', end: false, feature: 'crm.tasks' },
+    { to: '/reports', icon: 'reports', label: '报表', end: false, feature: 'crm.reports' },
+  ]
+  if (user?.role === 'admin') {
+    items.push(
+      { to: '/stages', icon: 'stages', label: '销售阶段', end: false },
+      { to: '/import', icon: 'import', label: '数据导入', end: false, feature: 'import.export' },
+      { to: '/users', icon: 'users', label: '成员管理', end: false },
+      { to: '/audit', icon: 'audit', label: '审计日志', end: false },
+    )
+  }
+  return items
 }
 
 let setSidebarOpenGlobal = null

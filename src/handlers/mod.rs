@@ -6,6 +6,7 @@ pub mod entitlements;
 pub mod health;
 pub mod import;
 pub mod pipeline;
+pub mod reports;
 pub mod settings;
 pub mod stages;
 pub mod tasks;

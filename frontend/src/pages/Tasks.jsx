@@ -1,17 +1,13 @@
 import { useEffect, useState } from 'react'
 import * as api from '../api'
-import { Page, Sidebar } from '../components/Layout'
+import { Page, Sidebar, getNavItems } from '../components/Layout'
 import { fmtDateTime, TableSkeleton, EmptyState } from '../components/ui'
 import { getErrorMessage } from '../api/client'
-
-const navItems = [
-  { to: '/customers', icon: 'customers', label: '客户库', end: false },
-  { to: '/kanban', icon: 'kanban', label: '销售看板', end: false },
-  { to: '/dashboard', icon: 'dashboard', label: '数据看板', end: false },
-  { to: '/tasks', icon: 'tasks', label: '我的待办', end: false },
-]
+import { useAuth } from '../auth'
 
 export default function Tasks() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [tasks, setTasks] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -93,9 +89,20 @@ export default function Tasks() {
   const done = tasks.filter((t) => t.status === 'done')
   const cancelled = tasks.filter((t) => t.status === 'cancelled')
 
+  // 逾期判定：pending 且截止时间已过（列表页逾期标红，spec §2.1）
+  const isOverdue = (t) => t.status === 'pending' && new Date(t.due_at) < new Date()
+
+  // 任务副标题行：客户公司 +（admin）负责人
+  const taskMeta = (t) => {
+    const parts = []
+    if (t.customer_company) parts.push(t.customer_company)
+    if (isAdmin && t.assignee_name) parts.push(`负责人：${t.assignee_name}`)
+    return parts.length > 0 ? <div className="task-meta">{parts.join(' · ')}</div> : null
+  }
+
   return (
     <div className="layout">
-      <Sidebar navItems={navItems} />
+      <Sidebar navItems={getNavItems(user)} />
       <Page>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h1 className="page-title" style={{ marginBottom: 0 }}>我的待办</h1>
@@ -162,10 +169,14 @@ export default function Tasks() {
                 <div className="empty-state">没有待处理任务</div>
               ) : (
                 pending.map((t) => (
-                  <div key={t.id} className="task-item">
+                  <div key={t.id} className={`task-item${isOverdue(t) ? ' task-overdue' : ''}`}>
                     <div style={{ flex: 1 }}>
                       <div className="task-title">{t.title}</div>
-                      <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
+                      {taskMeta(t)}
+                      <div className="task-due">
+                        截止：{fmtDateTime(t.due_at)}
+                        {isOverdue(t) && <span className="badge badge-overdue">已逾期</span>}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', gap: 4 }}>
                       <button className="btn btn-secondary btn-sm" onClick={() => updateStatus(t.id, 'done')}>完成</button>
@@ -184,6 +195,7 @@ export default function Tasks() {
                   <div key={t.id} className="task-item">
                     <div style={{ flex: 1 }}>
                       <div className="task-title" style={{ textDecoration: 'line-through', opacity: 0.6 }}>{t.title}</div>
+                      {taskMeta(t)}
                       <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
                     </div>
                     <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
@@ -203,6 +215,7 @@ export default function Tasks() {
                   <div key={t.id} className="task-item">
                     <div style={{ flex: 1 }}>
                       <div className="task-title" style={{ opacity: 0.5 }}>{t.title}</div>
+                      {taskMeta(t)}
                       <div className="task-due">截止：{fmtDateTime(t.due_at)}</div>
                     </div>
                     <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>

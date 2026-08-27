@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use sqlx::PgPool;
 
-use crate::services::{audit, auth};
+use crate::services::{audit, auth, feature};
 
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
@@ -43,6 +43,10 @@ pub async fn list(
             Json(serde_json::json!({ "error": "Only admin can view audit logs" })),
         )
             .into_response();
+    }
+    // 功能分级：审计日志属基础档（crm.audit）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.audit").await {
+        return resp;
     }
 
     let logs = audit::list(&pool, user.tenant_id, query.limit).await;
