@@ -59,15 +59,15 @@ jobs:
           DEPLOY_KEY: ${{ secrets.CRM_RB26164F_DEPLOY_KEY }}
         run: |
           mkdir -p ~/.ssh && echo "$DEPLOY_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 124.223.13.181 >> ~/.ssh/known_hosts 2>/dev/null
-          SSH="ssh -o BatchMode=yes -i ~/.ssh/deploy_key root@124.223.13.181"
+          ssh-keyscan -H 1.95.15.110 >> ~/.ssh/known_hosts 2>/dev/null
+          SSH="ssh -o BatchMode=yes -i ~/.ssh/deploy_key root@1.95.15.110"
           SCP="scp -o BatchMode=yes -i ~/.ssh/deploy_key"
           # 迁移文件必须随二进制同步（后端启动时全量重放）；不同步 = 新迁移不到生产（003 曾因此缺表导致 403）
-          $SCP migrations/*.sql root@124.223.13.181:/opt/crm-rb26164f/migrations/
+          $SCP migrations/*.sql root@1.95.15.110:/opt/TrueProject/crm-rb26164f/migrations/
           $SSH "docker stop crm_rb26164f_backend"
-          $SCP target/x86_64-unknown-linux-musl/release/crm-rb26164f root@124.223.13.181:/opt/crm-rb26164f/bin/crm-rb26164f
-          $SSH "rm -rf /opt/crm-rb26164f/frontend/*"
-          $SCP -r frontend/dist/* root@124.223.13.181:/opt/crm-rb26164f/frontend/
+          $SCP target/x86_64-unknown-linux-musl/release/crm-rb26164f root@1.95.15.110:/opt/TrueProject/crm-rb26164f/bin/crm-rb26164f
+          $SSH "rm -rf /opt/TrueProject/crm-rb26164f/frontend/dist/*"
+          $SCP -r frontend/dist/* root@1.95.15.110:/opt/TrueProject/crm-rb26164f/frontend/dist/
           $SSH "docker start crm_rb26164f_backend"
 
       - name: 上线验证
