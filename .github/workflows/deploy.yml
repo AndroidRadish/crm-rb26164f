@@ -6,6 +6,12 @@ on:
   workflow_dispatch:
 
 # 约定：master 上的每个 commit 都可上生产。测试不过 → 不部署。
+
+# 同分支部署串行化：后到 run 排队不并行（防新旧二进制互相覆盖降级，9-04 实战踩过）
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
