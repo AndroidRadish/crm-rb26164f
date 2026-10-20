@@ -39,8 +39,32 @@ pub struct AuthUser {
     pub tenant_id: Uuid,
 }
 
-fn jwt_secret() -> String {
-    std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-secret".to_string())
+/// JWT_SECRET 环境变量名（签发与校验共用同一入口）
+pub const JWT_SECRET_ENV: &str = "JWT_SECRET";
+
+/// 解析 JWT_SECRET：未配置 / 空串 / 纯空白一律 Err（fail-fast）。
+///
+/// 安全（C-P0-1）：旧写法在未配置时静默回退到源码公开常量 `dev-secret`，
+/// 等于把签名密钥告诉所有人 → 任何人都能伪造任意租户 admin token。
+/// 这里彻底删除回退值：宁可拒绝启动，也不接受人尽皆知的密钥。
+fn resolve_jwt_secret(raw: Option<&str>) -> anyhow::Result<String> {
+    match raw.map(str::trim) {
+        Some(secret) if !secret.is_empty() => Ok(secret.to_string()),
+        _ => Err(anyhow::anyhow!(
+            "JWT_SECRET 未配置或为空：拒绝启动（源码内置默认密钥已移除，否则任何人都能伪造 token）"
+        )),
+    }
+}
+
+/// 读取并校验 JWT_SECRET（每次签发/校验都走同一入口）
+pub fn jwt_secret() -> anyhow::Result<String> {
+    let raw = std::env::var(JWT_SECRET_ENV).ok();
+    resolve_jwt_secret(raw.as_deref())
+}
+
+/// 启动自检：无 JWT_SECRET 直接拒绝启动，不把问题拖到第一个请求。
+pub fn ensure_jwt_secret_configured() -> anyhow::Result<()> {
+    jwt_secret().map(|_| ())
 }
 
 pub fn generate_token(user: &User) -> anyhow::Result<String> {
@@ -57,18 +81,20 @@ pub fn generate_token(user: &User) -> anyhow::Result<String> {
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
+    let secret = jwt_secret()?;
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(jwt_secret().as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()),
     )?;
     Ok(token)
 }
 
 pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
+    let secret = jwt_secret()?;
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(jwt_secret().as_bytes()),
+        &DecodingKey::from_secret(secret.as_bytes()),
         &Validation::default(),
     )?;
     Ok(token_data.claims)
@@ -212,4 +238,36 @@ pub async fn get_default_tenant(pool: &PgPool) -> anyhow::Result<Uuid> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("No tenant configured"))?;
     Ok(row.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_jwt_secret;
+
+    /// 负：未配置环境变量 → 拒绝（不得回退公开常量）
+    #[test]
+    fn missing_secret_rejected() {
+        let err = resolve_jwt_secret(None).expect_err("未配置 JWT_SECRET 必须拒绝");
+        assert!(
+            err.to_string().contains("JWT_SECRET"),
+            "报错必须点名 JWT_SECRET: {err}"
+        );
+    }
+
+    /// 负：空串 / 纯空白同样视为未配置
+    #[test]
+    fn empty_and_whitespace_secret_rejected() {
+        assert!(resolve_jwt_secret(Some("")).is_err(), "空串必须拒绝");
+        assert!(resolve_jwt_secret(Some("   ")).is_err(), "纯空白必须拒绝");
+        assert!(resolve_jwt_secret(Some("\t\n")).is_err(), "空白字符必须拒绝");
+    }
+
+    /// 正：配置了非空值 → 采用（并去掉首尾空白，避免 env 带换行导致签名不一致）
+    #[test]
+    fn configured_secret_accepted_and_trimmed() {
+        assert_eq!(
+            resolve_jwt_secret(Some("  s3cret-value  ")).expect("非空值应被接受"),
+            "s3cret-value"
+        );
+    }
 }

@@ -20,7 +20,15 @@ fn unauthorized() -> impl IntoResponse {
 }
 
 /// GET /api/import/template — 下载导入模板（CSV 格式）
-pub async fn template() -> impl IntoResponse {
+pub async fn template(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
+    // C-P2-2：模板下载此前完全公开；导入属专业档能力，模板随导入一起收口
+    let user = match auth::extract_user(&headers) {
+        Ok(u) => u,
+        Err(_) => return unauthorized().into_response(),
+    };
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "import.export").await {
+        return resp;
+    }
     let csv_content = "公司名,联系人,电话,邮箱,地址,备注,阶段\n示例公司,张三,13800138000,zhangsan@example.com,北京市朝阳区,示例备注,线索\n";
     (
         StatusCode::OK,

@@ -454,6 +454,10 @@ pub async fn check_duplicate_handler(
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：防撞单查询属客户库能力（crm.customers），与列表/新建同门
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.customers").await {
+        return resp;
+    }
 
     let company = req.get("company").and_then(|v| v.as_str()).unwrap_or("");
     let phone = req.get("phone").and_then(|v| v.as_str());

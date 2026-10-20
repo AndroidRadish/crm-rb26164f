@@ -28,7 +28,9 @@ services:
       - ./migrations:/app/migrations:ro
     environment:
       DATABASE_URL: postgres://crm:${DB_PASSWORD:-crm_rb26164f_pass_2026}@db:5432/crm_rb26164f
-      JWT_SECRET: ${JWT_SECRET:-crm_rb26164f_jwt_secret_2026}
+      # 安全（C-P0-1）：禁止仓内默认值回退。必须显式注入（deploy/.env 或 shell env），
+      # 未配置时 compose 直接报错、后端也会拒绝启动。
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (deploy/.env, 64 random chars)}
       RUST_LOG: info
       PORT: "9092"
       MIGRATIONS_DIR: /app/migrations

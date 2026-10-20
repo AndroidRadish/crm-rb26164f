@@ -26,7 +26,9 @@ services:
       - ./migrations:/app/migrations:ro
     environment:
       DATABASE_URL: postgres://crm:crm_rb26164f_pass_2026@db:5432/crm_rb26164f
-      JWT_SECRET: crm_rb26164f_jwt_secret_2026
+      # 安全（C-P0-1）：生产密钥只从 deploy/.env（git 忽略，600）注入，仓内不留默认值。
+      # 启动：docker compose -f deploy/server-docker-compose.yml --env-file deploy/.env up -d
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in deploy/.env (64 random chars)}
       RUST_LOG: info
       PORT: "9092"
       MIGRATIONS_DIR: /app/migrations

@@ -18,16 +18,39 @@ pub async fn get_settings(State(pool): State<PgPool>, headers: HeaderMap) -> imp
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
         }
     };
-    let rows: Vec<(String, String)> = sqlx::query_as(
+    let rows: Vec<(String, String)> = match sqlx::query_as(
         "SELECT key, value FROM settings WHERE tenant_id = $1",
     )
     .bind(user.tenant_id)
     .fetch_all(&pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // 读失败不能静默降级成"空配置"（会把故障伪装成"未配置"，误导排障）
+            tracing::error!("读取 settings 失败: tenant={} err={}", user.tenant_id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "读取设置失败"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 安全（C-P1-1）：webhook URL 里带机器人 key，等同凭据。
+    // member 只拿到「已配置/未配置」布尔，不返回 URL 明文；明文仅 admin 可见。
+    // 写入口本就只对 admin 开放，读侧按角色收敛是第二道闸。
+    let admin = auth::is_admin(&user);
     let map: serde_json::Map<String, serde_json::Value> = rows
         .into_iter()
-        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .map(|(k, v)| {
+            let value = if admin {
+                serde_json::Value::String(v)
+            } else {
+                serde_json::Value::Bool(!v.trim().is_empty())
+            };
+            (k, value)
+        })
         .collect();
     (StatusCode::OK, Json(serde_json::Value::Object(map))).into_response()
 }

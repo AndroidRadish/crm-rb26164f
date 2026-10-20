@@ -7,7 +7,7 @@ import FeatureGate from '../components/FeatureGate'
 import { useAuth } from '../auth'
 
 export default function Dashboard() {
-  const { user } = useAuth()
+  const { user, isAdmin } = useAuth()
   const [stats, setStats] = useState(null)
   const [funnel, setFunnel] = useState([])
   const [loading, setLoading] = useState(true)
@@ -93,9 +93,13 @@ export default function Dashboard() {
           </div>
         )}
 
-        <FeatureGate feature="notify.webhook">
-          <WebhookSettings />
-        </FeatureGate>
+        {/* 写仍 admin（后端 PUT /settings 仅 admin）：member 端读到的 webhook 是
+            「已配置/未配置」布尔而非明文，这里也不再给 member 渲染不可写的表单 */}
+        {isAdmin && (
+          <FeatureGate feature="notify.webhook">
+            <WebhookSettings />
+          </FeatureGate>
+        )}
       </Page>
     </div>
   )

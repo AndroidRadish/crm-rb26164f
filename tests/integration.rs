@@ -61,6 +61,9 @@ async fn ensure_tenant(pool: &sqlx::PgPool) -> uuid::Uuid {
 async fn start_server() -> String {
     // owner 管理端令牌（测试环境固定值；生产由部署环境变量注入）
     std::env::set_var("OWNER_TOKEN", "test-owner-token");
+    // JWT_SECRET（测试环境固定值；生产由部署 env 注入）。
+    // 代码已删除源码回退常量，未配置会拒绝启动 —— 测试进程必须显式提供。
+    std::env::set_var("JWT_SECRET", "test-jwt-secret-not-the-public-default");
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test".to_string()
@@ -702,9 +705,10 @@ async fn test_import_and_export() {
     let admin_token = setup_user(&client, &base, "admin12", "admin123", "admin").await;
     let member_token = setup_user(&client, &base, "member5", "member123", "member").await;
 
-    // 模板下载
+    // 模板下载（C-P2-2：已补 auth/feature 门，必须带令牌）
     let resp = client
         .get(&format!("{}/api/import/template", base))
+        .header("Authorization", format!("Bearer {}", admin_token))
         .send()
         .await
         .unwrap();
@@ -2273,4 +2277,278 @@ async fn test_activities_feature_gate() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "恢复授权后时间线应可用");
+}
+
+// ── req-crm-jwt-fix：JWT fail-fast / settings 凭据守卫 / 功能门补齐 ──────────
+
+/// F1（C-P0-1）：未配置 JWT_SECRET（含空串/纯空白）→ 进程拒绝启动且明确报错。
+/// 用独立子进程验证"启动即拒"，不污染测试进程环境；超时保护防止回归成"挂起不退出"。
+#[test]
+fn test_jwt_secret_missing_refuses_startup() {
+    let cases: [(&str, Option<&str>); 3] = [
+        ("未配置", None),
+        ("空串", Some("")),
+        ("纯空白", Some("   ")),
+    ];
+    for (label, secret) in cases {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_crm-rb26164f"));
+        cmd.env_remove("JWT_SECRET")
+            .env("PORT", "0")
+            .env(
+                "DATABASE_URL",
+                "postgres://postgres:postgres@localhost:5432/crm_rb26164f_test",
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(value) = secret {
+            cmd.env("JWT_SECRET", value);
+        }
+
+        let mut child = cmd.spawn().expect("spawn crm binary");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    child.kill().ok();
+                    panic!("{label}: 缺 JWT_SECRET 时进程没有拒绝启动（10s 仍在运行）");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        let out = child.wait_with_output().expect("collect output");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{label}: 缺 JWT_SECRET 必须非 0 退出");
+        assert!(
+            stderr.contains("JWT_SECRET"),
+            "{label}: 报错必须点名 JWT_SECRET，实际 stderr={stderr}"
+        );
+    }
+}
+
+/// F2 回归：旧源码公开常量 `dev-secret` 签发的 token 必须 401；
+/// 同一时刻配置密钥签发的正常登录 token 必须可用（正负成对）。
+#[tokio::test]
+async fn test_old_public_default_secret_token_rejected() {
+    let base = start_server().await;
+    let client = Client::new();
+    let tenant_id = current_tenant_id().await;
+
+    let now = chrono::Utc::now();
+    let forged_claims = serde_json::json!({
+        "sub": uuid::Uuid::new_v4().to_string(),
+        "username": "forged-admin",
+        "role": "admin",
+        "tenant_id": tenant_id.to_string(),
+        "iat": now.timestamp(),
+        "exp": (now + chrono::Duration::hours(1)).timestamp(),
+    });
+    let forged = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &forged_claims,
+        &jsonwebtoken::EncodingKey::from_secret(b"dev-secret"),
+    )
+    .expect("sign forged token");
+
+    // 负：旧公开常量签发 → 401
+    let resp = client
+        .get(&format!("{}/api/auth/me", base))
+        .bearer_auth(&forged)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "旧公开常量 dev-secret 签发的 token 必须被拒");
+
+    // 正：配置密钥签发的真实登录 token → 200
+    let token = setup_user(&client, &base, "admin-jwt", "admin123", "admin").await;
+    let resp = client
+        .get(&format!("{}/api/auth/me", base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "配置密钥签发的正常 token 应可用");
+}
+
+/// F3（C-P1-1）：admin GET /settings 见 webhook 明文；member 只见「已配置/未配置」布尔，
+/// 响应体里不得出现 URL 明文（正负成对）。
+#[tokio::test]
+async fn test_settings_webhook_redacted_for_member() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "admin-settings", "admin123", "admin").await;
+    let member = setup_user(&client, &base, "member-settings", "member123", "member").await;
+    let hook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-key-abc";
+
+    // 负：未授权读 → 401
+    let resp = client
+        .get(&format!("{}/api/settings", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "未授权不得读设置");
+
+    // 正：admin 写入（一个已配置、一个未配置）
+    let resp = client
+        .put(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({
+            "wecom_webhook_url": hook,
+            "dingtalk_webhook_url": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "admin 应能保存 webhook 设置");
+
+    // 正：admin 读 → 明文
+    let resp = client
+        .get(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let admin_body: Value = resp.json().await.unwrap();
+    assert_eq!(admin_body["wecom_webhook_url"], hook, "admin 应看到 URL 明文");
+    assert_eq!(admin_body["dingtalk_webhook_url"], "", "admin 应看到原始值");
+
+    // 负：member 读 → 布尔，且响应体不含 URL 明文
+    let resp = client
+        .get(&format!("{}/api/settings", base))
+        .header("Authorization", format!("Bearer {}", member))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "member 可读设置（但内容脱敏）");
+    let member_body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        member_body["wecom_webhook_url"], true,
+        "member 只应看到「已配置」布尔"
+    );
+    assert_eq!(
+        member_body["dingtalk_webhook_url"], false,
+        "member 只应看到「未配置」布尔"
+    );
+    assert!(
+        !member_body.to_string().contains("qyapi.weixin.qq.com"),
+        "member 响应体不得出现 webhook URL 明文: {member_body}"
+    );
+}
+
+/// F4（C-P2-2）：/customers/check-duplicate、/dashboard、/import/template 三处
+/// 未授权 401、有授权 200、功能关闭 403（带 feature key），全部正负成对。
+#[tokio::test]
+async fn test_check_duplicate_dashboard_template_gates() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "admin-gates", "admin123", "admin").await;
+    let tenant_id = current_tenant_id().await;
+
+    // ── 未授权：三处全部 401（template 此前完全公开，是本次修复点） ──
+    let resp = client
+        .post(&format!("{}/api/customers/check-duplicate", base))
+        .json(&serde_json::json!({ "company": "任意公司" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "check-duplicate 未授权必须 401");
+
+    let resp = client
+        .get(&format!("{}/api/dashboard", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "dashboard 未授权必须 401");
+
+    let resp = client
+        .get(&format!("{}/api/import/template", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "import/template 未授权必须 401");
+
+    // ── 有授权：三处全部 200 ──
+    let resp = client
+        .post(&format!("{}/api/customers/check-duplicate", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "company": "任意公司" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 check-duplicate 应可用");
+
+    let resp = client
+        .get(&format!("{}/api/dashboard", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权 dashboard 应可用");
+
+    let resp = client
+        .get(&format!("{}/api/import/template", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "有授权模板下载应可用");
+
+    // ── 负：关掉对应功能 → 403 且带 feature key ──
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.customers": false, "crm.funnel": false, "import.export": false }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+
+    let resp = client
+        .post(&format!("{}/api/customers/check-duplicate", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({ "company": "任意公司" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "crm.customers 关闭后 check-duplicate 必须 403");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "crm.customers");
+
+    let resp = client
+        .get(&format!("{}/api/dashboard", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "crm.funnel 关闭后 dashboard 必须 403");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "crm.funnel");
+
+    let resp = client
+        .get(&format!("{}/api/import/template", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "import.export 关闭后模板下载必须 403");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["feature"], "import.export");
+
+    // ── 恢复：三处回到可用 ──
+    let resp = owner_put_features(
+        &client,
+        &base,
+        tenant_id,
+        serde_json::json!({ "crm.customers": true, "crm.funnel": true, "import.export": true }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(&format!("{}/api/import/template", base))
+        .header("Authorization", format!("Bearer {}", admin))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "恢复授权后模板下载应可用");
 }

@@ -586,6 +586,10 @@ pub async fn dashboard(State(pool): State<PgPool>, headers: HeaderMap) -> impl I
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
+    // 功能分级：看板的漏斗维度与 /pipeline/funnel 同属 crm.funnel（C-P2-2 补齐功能门）
+    if let Err(resp) = feature::require_feature(&pool, user.tenant_id, "crm.funnel").await {
+        return resp;
+    }
 
     let scope = auth::scope_where(&user, "c");
 

@@ -52,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         CliCommand::Serve => {
+            // 安全（C-P0-1）：未配置 JWT_SECRET 直接拒绝启动（fail-fast），
+            // 不再回退到源码公开默认密钥。放在连库之前，保证配置缺失时立即失败。
+            services::auth::ensure_jwt_secret_configured()?;
             let pool = db::init_db(&database_url).await?;
             let cors = CorsLayer::new()
                 .allow_origin(Any)
