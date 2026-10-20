@@ -110,7 +110,9 @@ function WebhookSettings() {
   const [msg, setMsg] = useState('')
 
   useEffect(() => {
-    api.getSettings().then(d => setForm(f => ({ ...f, ...d }))).catch(() => {})
+    api.getSettings()
+      .then(d => setForm(f => ({ ...f, ...d })))
+      .catch(e => setMsg(getErrorMessage(e, '读取提醒设置失败')))
   }, [])
 
   const save = async () => {
