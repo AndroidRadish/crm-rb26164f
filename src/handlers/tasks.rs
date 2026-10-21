@@ -255,25 +255,10 @@ pub async fn create(
             )
             .await;
 
-            // 企微/钉钉 webhook 提醒
-            let channel_str = match &reminder {
-                crate::models::task::ReminderChannel::Wecom => "wecom",
-                crate::models::task::ReminderChannel::Dingtalk => "dingtalk",
-                _ => "system",
-            };
-            if channel_str != "system" {
-                let title = task.title.clone();
-                let due = task.due_at.to_rfc3339();
-                let _ = crate::services::webhook::send_reminder(
-                    &pool,
-                    user.tenant_id,
-                    channel_str,
-                    &title,
-                    &format!("截止时间：{}", due),
-                )
-                .await;
-            }
-
+            // 提醒统一由到期调度器（services::reminder）在 due_at 到点后发送。
+            // 建单即发会让同一任务在建单时 + 到期时各发一次（F1/F2 要求恰好 1 次），
+            // 且原实现 `let _ = send_reminder` 会把发送错误静默吞掉。
+            // 这里只落库，CRUD 出入参不变；是否/何时发送由 notified_at 调度状态决定。
             (StatusCode::CREATED, Json(task)).into_response()
         }
         Err(e) => (

@@ -2552,3 +2552,436 @@ async fn test_check_duplicate_dashboard_template_gates() {
         .unwrap();
     assert!(resp.status().is_success(), "恢复授权后模板下载应可用");
 }
+
+// ── 到期提醒调度器（spec: req-crm-reminder-scheduler）──────────────────────
+// 单轮驱动入口 `services::reminder::run_once`，测试无需等 60s interval。
+// 任务直接落库而非走 POST /tasks：创建接口本身有「建单即发」的既有行为，
+// 走 API 会让 mock 计数混入创建时的发送，测不出调度器本身的次数语义。
+
+/// 最小 HTTP/1.1 mock webhook：读完请求（按 Content-Length）后回固定 status。
+/// 返回 (URL, 请求计数)；计数即「上游收到提醒」的次数。
+async fn spawn_mock_webhook(
+    status: u16,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock webhook");
+    let addr = listener.local_addr().expect("mock webhook addr");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_inner = counter.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break, // 测试 runtime 结束时 listener 关闭
+            };
+            let counter = counter_inner.clone();
+            tokio::spawn(async move {
+                // 必须读完请求体再回包：提前关闭连接会让 reqwest 读到 RST 而非响应
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&data[..pos]);
+                        let body_len = head
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= pos + 4 + body_len {
+                            break;
+                        }
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reason = if (200..300).contains(&status) { "OK" } else { "Not Found" };
+                let body = "{}";
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    (format!("http://{}/webhook", addr), counter)
+}
+
+/// 写租户级 webhook 设置（调度器经 settings 读取；空值才会回退环境变量）
+async fn set_webhook_url(pool: &sqlx::PgPool, tenant_id: uuid::Uuid, key: &str, url: &str) {
+    sqlx::query(
+        "INSERT INTO settings (tenant_id, key, value) VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+    )
+    .bind(tenant_id)
+    .bind(key)
+    .bind(url)
+    .execute(pool)
+    .await
+    .expect("写入 webhook 设置");
+}
+
+/// 直接落库一条到期任务（绕过 POST /tasks 的建单即发），返回 task id
+async fn insert_due_task(
+    pool: &sqlx::PgPool,
+    tenant_id: uuid::Uuid,
+    channel: &str,
+    due_offset_secs: i64,
+) -> uuid::Uuid {
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (tenant_id, username, password_hash, role) \
+         VALUES ($1, 'reminder-fixture', 'x', 'member') \
+         ON CONFLICT (tenant_id, username) DO UPDATE SET role = 'member' RETURNING id",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .expect("fixture user");
+
+    let customer_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO customers (tenant_id, company, owner_id, source) \
+         VALUES ($1, '提醒调度测试公司', $2, 'manual') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("fixture customer");
+
+    let due_at = chrono::Utc::now() + chrono::Duration::seconds(due_offset_secs);
+    sqlx::query_scalar(
+        "INSERT INTO tasks (tenant_id, customer_id, user_id, title, due_at, reminder_channel) \
+         VALUES ($1, $2, $3, '到期提醒测试任务', $4, $5::reminder_channel) RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(customer_id)
+    .bind(user_id)
+    .bind(due_at)
+    .bind(channel)
+    .fetch_one(pool)
+    .await
+    .expect("fixture task")
+}
+
+/// 读任务的 notified_at（None = 未发送/已回滚待重试）
+async fn task_notified_at(
+    pool: &sqlx::PgPool,
+    task_id: uuid::Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT notified_at FROM tasks WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+    .expect("查询 notified_at")
+}
+
+/// F1/F2（全链）：到期 wecom 任务 → 上游恰好 1 次提醒 + tasks.notified_at 非空；
+/// 未到期任务不发；再跑两轮不重发。负向：webhook 不可达时不标 notified_at。
+#[tokio::test]
+async fn test_reminder_scheduler_fires_once_on_due() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+    let (url, hits) = spawn_mock_webhook(200).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &url).await;
+
+    let due_task = insert_due_task(&pool, tenant_id, "wecom", -1).await;
+    let future_task = insert_due_task(&pool, tenant_id, "wecom", 300).await;
+
+    let sent = crm_rb26164f::services::reminder::run_once(&pool)
+        .await
+        .expect("run_once");
+    assert_eq!(sent, 1, "只应发送已到期的那条任务");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "上游应恰好收到 1 次提醒");
+    assert!(
+        task_notified_at(&pool, due_task).await.is_some(),
+        "发送成功后 notified_at 必须非空"
+    );
+    assert!(
+        task_notified_at(&pool, future_task).await.is_none(),
+        "未到期任务不得标记 notified_at"
+    );
+
+    // 连跑两轮：同一任务不重复发送
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once round2"),
+        0
+    );
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once round3"),
+        0
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "多轮扫描后上游仍只应收到 1 次提醒"
+    );
+}
+
+/// F2：并发两实例（两个 run_once 同时扫同一批到期任务）→ 同一任务只发 1 次
+#[tokio::test]
+async fn test_reminder_scheduler_concurrent_instances_send_once() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+    let (url, hits) = spawn_mock_webhook(200).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &url).await;
+
+    let task_id = insert_due_task(&pool, tenant_id, "wecom", -1).await;
+
+    let (a, b) = tokio::join!(
+        crm_rb26164f::services::reminder::run_once(&pool),
+        crm_rb26164f::services::reminder::run_once(&pool)
+    );
+    let total = a.expect("instance a") + b.expect("instance b");
+    assert_eq!(total, 1, "并发两实例合计只应发送 1 条任务");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "并发抢占下上游只应收到 1 次提醒"
+    );
+    assert!(
+        task_notified_at(&pool, task_id).await.is_some(),
+        "抢占成功后 notified_at 非空"
+    );
+}
+
+/// F3：webhook 404 → notified_at 回 NULL（下轮重试）→ 修复 URL 后轮二成功
+#[tokio::test]
+async fn test_reminder_scheduler_retries_after_webhook_failure() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+
+    let (bad_url, bad_hits) = spawn_mock_webhook(404).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &bad_url).await;
+    let task_id = insert_due_task(&pool, tenant_id, "wecom", -1).await;
+
+    // 轮一：404 → 发送失败，标记回滚为 NULL 供重试
+    let sent = crm_rb26164f::services::reminder::run_once(&pool)
+        .await
+        .expect("run_once (failing webhook)");
+    assert_eq!(sent, 0, "404 不应计入成功数");
+    assert_eq!(bad_hits.load(std::sync::atomic::Ordering::SeqCst), 1, "失败路径确实请求了上游");
+    assert!(
+        task_notified_at(&pool, task_id).await.is_none(),
+        "发送失败必须把 notified_at 清回 NULL"
+    );
+
+    // 轮二：修复 URL → 重试成功
+    let (good_url, good_hits) = spawn_mock_webhook(200).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &good_url).await;
+    let sent = crm_rb26164f::services::reminder::run_once(&pool)
+        .await
+        .expect("run_once (recovered webhook)");
+    assert_eq!(sent, 1, "修复 URL 后重试应成功");
+    assert_eq!(good_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        task_notified_at(&pool, task_id).await.is_some(),
+        "重试成功后 notified_at 非空"
+    );
+
+    // 轮三：不重复发送
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once round3"),
+        0
+    );
+    assert_eq!(
+        good_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "成功后不得重复发送"
+    );
+}
+
+/// F4：system 渠道到期 → 不请求 webhook、不报错，只标 notified_at
+#[tokio::test]
+async fn test_reminder_scheduler_system_channel_marks_without_webhook() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+    // 故意配置一个会失败的 webhook：system 渠道根本不该请求它
+    let (url, hits) = spawn_mock_webhook(500).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &url).await;
+
+    let task_id = insert_due_task(&pool, tenant_id, "system", -1).await;
+    let sent = crm_rb26164f::services::reminder::run_once(&pool)
+        .await
+        .expect("system 渠道不应报错");
+    assert_eq!(sent, 1, "system 渠道视为发送完成");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "system 渠道不得请求 webhook"
+    );
+    assert!(
+        task_notified_at(&pool, task_id).await.is_some(),
+        "system 渠道到期应直接标记 notified_at"
+    );
+
+    // 已标记后不重复处理
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once round2"),
+        0
+    );
+}
+
+/// 约束：webhook URL 明文（含机器人 key）不得出现在错误信息/日志里。
+/// 用连不通的地址触发 reqwest 网络错误（该错误默认会带 URL），断言已被剥离。
+#[tokio::test]
+async fn test_reminder_error_message_does_not_leak_webhook_url() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+    let secret_url = "http://127.0.0.1:1/hook?key=top-secret-key";
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", secret_url).await;
+
+    let err = crm_rb26164f::services::webhook::send_reminder(
+        &pool,
+        tenant_id,
+        "wecom",
+        "提醒标题",
+        "提醒正文",
+    )
+    .await
+    .expect_err("连不通的 webhook 必须报错（供调度器回滚重试）");
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("top-secret-key"), "错误信息不得泄露 webhook key: {msg}");
+    assert!(!msg.contains("127.0.0.1:1"), "错误信息不得包含 webhook URL: {msg}");
+}
+
+/// F1/F2 全链（API 建单 → 到期调度 → 上游）：
+/// POST /tasks 建一条已到期的 wecom 任务 → 建单本身不得发提醒（否则建单+到期会重复），
+/// 调度单轮后上游恰好 1 次、tasks.notified_at 非空；再跑不重复。
+#[tokio::test]
+async fn test_reminder_full_chain_via_task_api() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "reminder_api_admin", "admin123", "admin").await;
+    let pool = test_pool().await;
+    let tenant_id = current_tenant_id().await;
+    let (url, hits) = spawn_mock_webhook(200).await;
+    set_webhook_url(&pool, tenant_id, "wecom_webhook_url", &url).await;
+
+    let customer = create_customer(&client, &base, &admin, "全链提醒公司").await;
+    let customer_id = customer["id"].as_str().expect("customer id");
+    let resp = client
+        .post(&format!("{}/api/customers/{}/tasks", base, customer_id))
+        .header("Authorization", format!("Bearer {}", admin))
+        .json(&serde_json::json!({
+            "title": "全链到期任务",
+            "due_at": "2020-01-01T00:00:00Z",
+            "reminder_channel": "wecom",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "建单应成功");
+    let task: Value = resp.json().await.unwrap();
+    let task_id = uuid::Uuid::parse_str(task["id"].as_str().expect("task id")).expect("uuid");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "建单接口不得即时发送提醒（到点由调度器发送恰好 1 次）"
+    );
+    assert!(
+        task_notified_at(&pool, task_id).await.is_none(),
+        "建单后尚未发送，notified_at 应为 NULL"
+    );
+
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once"),
+        1
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "到期后上游应恰好收到 1 次提醒"
+    );
+    assert!(
+        task_notified_at(&pool, task_id).await.is_some(),
+        "调度发送成功后 notified_at 非空"
+    );
+
+    assert_eq!(
+        crm_rb26164f::services::reminder::run_once(&pool)
+            .await
+            .expect("run_once round2"),
+        0
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "同一任务不得重复发送"
+    );
+}
+
+/// 租户隔离（正负成对）：调度器是后台任务、绕过用户鉴权，
+/// 必须按任务自身 tenant_id 取该租户的 webhook 设置——两个租户各一条到期任务，
+/// 各自上游恰好 1 次，不能串到对方（错租户会表现为一边 2 次、一边 0 次）。
+#[tokio::test]
+async fn test_reminder_scheduler_tenant_scoped() {
+    let _base = start_server().await;
+    let pool = test_pool().await;
+    let tenant_a = current_tenant_id().await;
+    let tenant_b: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (name, code) VALUES ('提醒租户B', 'reminder-b') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tenant b");
+
+    let (url_a, hits_a) = spawn_mock_webhook(200).await;
+    let (url_b, hits_b) = spawn_mock_webhook(200).await;
+    set_webhook_url(&pool, tenant_a, "wecom_webhook_url", &url_a).await;
+    set_webhook_url(&pool, tenant_b, "wecom_webhook_url", &url_b).await;
+
+    let task_a = insert_due_task(&pool, tenant_a, "wecom", -1).await;
+    let task_b = insert_due_task(&pool, tenant_b, "wecom", -1).await;
+
+    let sent = crm_rb26164f::services::reminder::run_once(&pool)
+        .await
+        .expect("run_once");
+    assert_eq!(sent, 2, "两个租户各一条到期任务都应发送");
+    assert_eq!(
+        hits_a.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "租户 A 的 webhook 只应收到自己那条"
+    );
+    assert_eq!(
+        hits_b.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "租户 B 的 webhook 只应收到自己那条"
+    );
+    assert!(task_notified_at(&pool, task_a).await.is_some());
+    assert!(task_notified_at(&pool, task_b).await.is_some());
+}

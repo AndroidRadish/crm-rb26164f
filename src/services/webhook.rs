@@ -23,7 +23,9 @@ pub async fn send_wecom(webhook_url: &str, title: &str, content: &str) -> anyhow
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("WeCom webhook send failed: {}", e))?;
+        // URL 里带机器人 key（等同凭据）：错误信息去掉 URL 再向上抛，
+        // 避免调度器/调用方把 URL 明文写进日志（req-crm-reminder-scheduler 约束）。
+        .map_err(|e| anyhow::anyhow!("WeCom webhook send failed: {}", e.without_url()))?;
 
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -49,7 +51,8 @@ pub async fn send_dingtalk(webhook_url: &str, title: &str, content: &str) -> any
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("DingTalk webhook send failed: {}", e))?;
+        // 同 send_wecom：错误信息不得携带含 key 的 URL 明文
+        .map_err(|e| anyhow::anyhow!("DingTalk webhook send failed: {}", e.without_url()))?;
 
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!(

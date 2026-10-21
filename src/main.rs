@@ -56,6 +56,15 @@ async fn main() -> anyhow::Result<()> {
             // 不再回退到源码公开默认密钥。放在连库之前，保证配置缺失时立即失败。
             services::auth::ensure_jwt_secret_configured()?;
             let pool = db::init_db(&database_url).await?;
+
+            // 到期提醒调度器（req-crm-reminder-scheduler）：每 60s 扫描 pending 到期任务，
+            // 抢占 notified_at 后发送 webhook。后台 task 随 axum serve 结束 / runtime 关闭
+            // 一起退出，无需额外 draining。
+            let scheduler_pool = pool.clone();
+            tokio::spawn(async move {
+                services::reminder::run_scheduler(scheduler_pool).await;
+            });
+
             let cors = CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
