@@ -29,7 +29,7 @@ fn unauthorized() -> impl IntoResponse {
 
 /// GET /api/reports/summary — 报表汇总（本月新增 / 成交率 / 逾期数）
 pub async fn summary(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };

@@ -22,7 +22,7 @@ fn unauthorized() -> impl IntoResponse {
 /// GET /api/import/template — 下载导入模板（CSV 格式）
 pub async fn template(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
     // C-P2-2：模板下载此前完全公开；导入属专业档能力，模板随导入一起收口
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -54,7 +54,7 @@ pub async fn upload(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -308,7 +308,7 @@ pub async fn upload(
 
 /// GET /api/import/batches — 列出导入批次
 pub async fn list_batches(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -336,7 +336,7 @@ pub async fn get_batch(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -372,7 +372,7 @@ pub async fn export_customers_csv(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };

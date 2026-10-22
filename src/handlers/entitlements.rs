@@ -32,7 +32,7 @@ fn owner_forbidden() -> impl IntoResponse {
 
 /// GET /api/entitlements — 当前租户的授权清单（默认档计算后结果）
 pub async fn list_mine(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };

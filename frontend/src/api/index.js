@@ -12,6 +12,17 @@ export const createUser = (username, password, role, display_name) =>
 
 export const listUsers = () => api.get('/users').then((r) => r.data)
 
+// 成员生命周期（admin）：停用后该成员立即无法登录，旧 token 下一次请求即 401
+export const deactivateUser = (id) =>
+  api.post(`/users/${id}/deactivate`).then((r) => r.data)
+
+export const activateUser = (id) =>
+  api.post(`/users/${id}/activate`).then((r) => r.data)
+
+// 管理员直接设新密码（不读旧密码）
+export const resetUserPassword = (id, password) =>
+  api.post(`/users/${id}/reset-password`, { password }).then((r) => r.data)
+
 // ============ customers ============
 export const listCustomers = (params) =>
   api.get('/customers', { params }).then((r) => r.data)

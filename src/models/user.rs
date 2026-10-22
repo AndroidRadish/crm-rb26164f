@@ -21,6 +21,8 @@ pub struct User {
     pub role: UserRole,
     pub display_name: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// 是否启用：false = 已停用（离职/收回账号），禁止登录且旧 token 立即失效
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -38,6 +40,12 @@ pub struct CreateUserRequest {
     pub password: String,
     pub role: Option<UserRole>,
     pub display_name: Option<String>,
+}
+
+/// 管理员重置成员密码（不读旧密码）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

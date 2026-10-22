@@ -39,7 +39,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(query): Query<CustomerQuery>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -105,7 +105,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<CreateCustomerRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -178,7 +178,7 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -220,7 +220,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateCustomerRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -394,7 +394,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -450,7 +450,7 @@ pub async fn check_duplicate_handler(
     headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -492,7 +492,7 @@ pub async fn claim(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -545,7 +545,7 @@ pub async fn release(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -603,7 +603,7 @@ pub async fn transfer(
     Path(id): Path<Uuid>,
     Json(req): Json<TransferCustomerRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -620,7 +620,7 @@ pub async fn transfer(
 
     // 新负责人必须是同 tenant 用户
     let new_owner = sqlx::query_as::<_, crate::models::user::User>(
-        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at \
+        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at, is_active \
          FROM users WHERE id = $1 AND tenant_id = $2",
     )
     .bind(req.owner_id)

@@ -21,6 +21,9 @@ use crate::models::user::{AuthResponse, User, UserRole};
 /// bcrypt cost：debug 下用 8 加速测试，release 下用 12
 const BCRYPT_COST: u32 = 8;
 
+/// 登录失败统一文案：用户不存在 / 密码错 / 账号已停用 三种情况必须完全一致（防账号枚举）
+const INVALID_CREDENTIALS: &str = "Invalid username or password";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,
@@ -124,8 +127,56 @@ pub fn extract_user(headers: &HeaderMap) -> Result<AuthUser, String> {
     })
 }
 
+/// 受保护端点的统一用户加载入口（按 token sub 查库）。
+///
+/// 与 [`extract_user`] 的区别：多一次库内校验（用户仍存在且 `is_active=true`）。
+/// 这是「停用即断」的执行点——停用后已签发的旧 token 即使未过期，
+/// 也在这里被拒（401），无需等 24h 过期。
+///
+/// 错误文案保持模糊（不区分「用户不存在 / 已停用」），与登录侧一致，避免账号枚举。
+pub async fn require_user(pool: &PgPool, headers: &HeaderMap) -> Result<AuthUser, String> {
+    let user = extract_user(headers)?;
+    let is_active: Option<bool> =
+        sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+            .bind(user.user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                // 查询失败不等于「用户有效」，也不能静默放行：显式拒绝并留日志
+                tracing::error!(
+                    user_id = %user.user_id,
+                    error = %e,
+                    "鉴权 is_active 查库失败，拒绝请求"
+                );
+                "Auth check unavailable".to_string()
+            })?;
+    match is_active {
+        Some(true) => Ok(user),
+        Some(false) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                username = %user.username,
+                "已停用账号的 token 被拒"
+            );
+            Err("Invalid or expired token".to_string())
+        }
+        None => {
+            tracing::warn!(user_id = %user.user_id, "token 指向的用户不存在，拒绝");
+            Err("Invalid or expired token".to_string())
+        }
+    }
+}
+
 pub fn is_admin(user: &AuthUser) -> bool {
     user.role == UserRole::Admin
+}
+
+/// 密码强度规则（注册与管理员重置共用，避免两处口径漂移）
+pub fn validate_password(password: &str) -> anyhow::Result<()> {
+    if password.len() < 6 {
+        return Err(anyhow::anyhow!("Password must be at least 6 characters"));
+    }
+    Ok(())
 }
 
 /// 工作室管理终端（owner）鉴权：与租户角色体系正交。
@@ -167,9 +218,7 @@ pub async fn register_user(
     role: Option<UserRole>,
     tenant_id: Uuid,
 ) -> anyhow::Result<AuthResponse> {
-    if password.len() < 6 {
-        return Err(anyhow::anyhow!("Password must be at least 6 characters"));
-    }
+    validate_password(password)?;
     let existing = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM users WHERE username = $1 AND tenant_id = $2",
     )
@@ -186,7 +235,7 @@ pub async fn register_user(
     let user = sqlx::query_as::<_, User>(
         "INSERT INTO users (tenant_id, username, password_hash, role) \
          VALUES ($1, $2, $3, $4) \
-         RETURNING id, tenant_id, username, password_hash, role, display_name, created_at",
+         RETURNING id, tenant_id, username, password_hash, role, display_name, created_at, is_active",
     )
     .bind(tenant_id)
     .bind(username)
@@ -205,16 +254,26 @@ pub async fn login_user(
     password: &str,
 ) -> anyhow::Result<AuthResponse> {
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at \
+        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at, is_active \
          FROM users WHERE username = $1 ORDER BY created_at LIMIT 1",
     )
     .bind(username)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| anyhow::anyhow!("Invalid username or password"))?;
+    .ok_or_else(|| anyhow::anyhow!("{}", INVALID_CREDENTIALS))?;
+    // 先验密码再判停用：两条失败路径对外文案完全一致（防账号枚举），
+    // 顺序也保证不会因为「已停用」提前返回而省掉 bcrypt 的耗时。
     let valid = verify(password, &user.password_hash)?;
     if !valid {
-        return Err(anyhow::anyhow!("Invalid username or password"));
+        return Err(anyhow::anyhow!("{}", INVALID_CREDENTIALS));
+    }
+    if !user.is_active {
+        tracing::warn!(
+            user_id = %user.id,
+            username = %user.username,
+            "已停用账号尝试登录，按密码错误统一拒绝"
+        );
+        return Err(anyhow::anyhow!("{}", INVALID_CREDENTIALS));
     }
     let token = generate_token(&user)?;
     Ok(AuthResponse { token, user })
@@ -222,7 +281,7 @@ pub async fn login_user(
 
 pub async fn get_user_by_id(pool: &PgPool, user_id: Uuid) -> anyhow::Result<User> {
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at \
+        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at, is_active \
          FROM users WHERE id = $1",
     )
     .bind(user_id)
@@ -230,6 +289,71 @@ pub async fn get_user_by_id(pool: &PgPool, user_id: Uuid) -> anyhow::Result<User
     .await?
     .ok_or_else(|| anyhow::anyhow!("User not found"))?;
     Ok(user)
+}
+
+/// 按租户取用户（跨租户一律当作不存在，避免探测他人租户成员）
+pub async fn get_user_in_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> anyhow::Result<Option<User>> {
+    let user = sqlx::query_as::<_, User>(
+        "SELECT id, tenant_id, username, password_hash, role, display_name, created_at, is_active \
+         FROM users WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user)
+}
+
+/// 本租户当前启用中的管理员数量（自锁防线用）
+pub async fn count_active_admins(pool: &PgPool, tenant_id: Uuid) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'admin' AND is_active",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// 启用/停用成员。返回更新后的用户；目标不在本租户时返回 None。
+pub async fn set_user_active(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    active: bool,
+) -> anyhow::Result<Option<User>> {
+    let user = sqlx::query_as::<_, User>(
+        "UPDATE users SET is_active = $3 WHERE id = $1 AND tenant_id = $2 \
+         RETURNING id, tenant_id, username, password_hash, role, display_name, created_at, is_active",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(active)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user)
+}
+
+/// 管理员重置成员密码（不读旧密码）。目标不在本租户时返回 false。
+pub async fn reset_user_password(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    new_password: &str,
+) -> anyhow::Result<bool> {
+    validate_password(new_password)?;
+    let password_hash = hash(new_password, BCRYPT_COST)?;
+    let result = sqlx::query("UPDATE users SET password_hash = $3 WHERE id = $1 AND tenant_id = $2")
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(&password_hash)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn get_default_tenant(pool: &PgPool) -> anyhow::Result<Uuid> {

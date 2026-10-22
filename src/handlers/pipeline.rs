@@ -22,7 +22,7 @@ fn unauthorized() -> impl IntoResponse {
 
 /// GET /api/pipeline — 列出管道条目（member 仅自己名下客户的条目）
 pub async fn list(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -56,7 +56,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<CreatePipelineEntryRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -156,7 +156,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -352,7 +352,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -403,7 +403,7 @@ pub async fn delete(
 
 /// GET /api/pipeline/kanban — 看板视图（按阶段分组）
 pub async fn kanban(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -528,7 +528,7 @@ pub async fn kanban(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
 
 /// GET /api/pipeline/funnel — 漏斗分析
 pub async fn funnel(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -582,7 +582,7 @@ pub async fn funnel(State(pool): State<PgPool>, headers: HeaderMap) -> impl Into
 
 /// GET /api/dashboard — 数据看板（个人/团队业绩）
 pub async fn dashboard(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };

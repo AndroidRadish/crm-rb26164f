@@ -17,6 +17,16 @@ pub fn router() -> Router<PgPool> {
             "/users",
             post(handlers::auth::create_user).get(handlers::auth::list_users),
         )
+        // 成员生命周期（req-crm-member-lifecycle）：admin 专属，handler 内做 admin 门禁
+        .route(
+            "/users/:id/deactivate",
+            post(handlers::auth::deactivate_user),
+        )
+        .route("/users/:id/activate", post(handlers::auth::activate_user))
+        .route(
+            "/users/:id/reset-password",
+            post(handlers::auth::reset_password),
+        )
         .route(
             "/customers",
             get(handlers::customers::list).post(handlers::customers::create),

@@ -25,7 +25,7 @@ pub async fn list(
     headers: HeaderMap,
     Path(customer_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -109,7 +109,7 @@ pub async fn create(
     Path(customer_id): Path<Uuid>,
     Json(req): Json<CreateActivityRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };

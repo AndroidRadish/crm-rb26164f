@@ -3074,3 +3074,361 @@ async fn test_reminder_scheduler_tenant_scoped() {
     assert!(task_notified_at(&pool, task_a).await.is_some());
     assert!(task_notified_at(&pool, task_b).await.is_some());
 }
+
+// ── req-crm-member-lifecycle：成员停用/启用/重置密码 + 旧 token 失效 ─────────
+
+/// 按用户名取 user id（setup_user 只回 token）
+async fn user_id_by_name(username: &str) -> uuid::Uuid {
+    let pool = test_pool().await;
+    sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_one(&pool)
+        .await
+        .expect("user id")
+}
+
+/// 登录并返回 (状态码, 响应体)
+async fn login_body(
+    client: &Client,
+    base: &str,
+    username: &str,
+    password: &str,
+) -> (reqwest::StatusCode, Value) {
+    let resp = client
+        .post(&format!("{}/api/auth/login", base))
+        .json(&serde_json::json!({ "username": username, "password": password }))
+        .send()
+        .await
+        .expect("login request");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// 调管理端点：POST /api/users/:id/{action}
+async fn manage_user(
+    client: &Client,
+    base: &str,
+    token: &str,
+    user_id: uuid::Uuid,
+    action: &str,
+    body: Option<Value>,
+) -> reqwest::Response {
+    let mut req = client
+        .post(&format!("{}/api/users/{}/{}", base, user_id, action))
+        .header("Authorization", format!("Bearer {}", token));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    req.send().await.expect("manage user request")
+}
+
+/// F1 + F2（全链）：admin 停用 member →
+/// users.is_active=false 且登录 401（文案与密码错误一致）且已签发旧 token 401；
+/// 重新启用 → users.is_active=true 且可正常登录。
+#[tokio::test]
+async fn test_member_lifecycle_deactivate_revokes_login_and_old_token() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "life-admin", "admin123", "admin").await;
+    let member = setup_user(&client, &base, "life-member", "member123", "member").await;
+    let member_id = user_id_by_name("life-member").await;
+
+    // 正基线：停用前 member 的 token 可用
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "停用前 member token 应可用");
+
+    // 密码错误的基线文案（停用后的报错必须与之完全一致，防账号枚举）
+    let (status, body) = login_body(&client, &base, "life-member", "wrong-password").await;
+    assert_eq!(status, 401, "错误密码应 401");
+    let wrong_password_error = body["error"]
+        .as_str()
+        .expect("登录错误文案")
+        .to_string();
+
+    // ── A 处操作：admin 停用 member ──
+    let resp = manage_user(&client, &base, &admin, member_id, "deactivate", None).await;
+    assert_eq!(resp.status(), 200, "admin 停用 member 应成功");
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(updated["is_active"], false, "停用响应应带 is_active=false");
+    assert_eq!(updated["username"], "life-member");
+
+    // ── B 处最终状态（全链断言）──
+    // ① 库内状态
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(member_id)
+        .fetch_one(&test_pool().await)
+        .await
+        .expect("read is_active");
+    assert!(!is_active, "停用后 users.is_active 必须为 false");
+    // ② 正确密码登录 401，且文案与密码错误完全一致
+    let (status, body) = login_body(&client, &base, "life-member", "member123").await;
+    assert_eq!(status, 401, "停用后即使密码正确也必须 401");
+    assert_eq!(
+        body["error"].as_str().expect("停用登录错误文案"),
+        wrong_password_error,
+        "停用报错文案必须与密码错误一致（防账号枚举）"
+    );
+    // ③ 停用前签发的旧 token 立即 401（无需等过期）
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "停用后已签发的旧 token 请求必须 401");
+    let resp = client
+        .get(&format!("{}/api/auth/me", base))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "停用后旧 token 访问详情也必须 401");
+
+    // 列表响应带 is_active（admin 可见）
+    let resp = client
+        .get(&format!("{}/api/users", base))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let users: Value = resp.json().await.unwrap();
+    let listed = users
+        .as_array()
+        .expect("user list array")
+        .iter()
+        .find(|u| u["username"] == "life-member")
+        .expect("list 中应包含目标成员");
+    assert_eq!(listed["is_active"], false, "列表响应必须带 is_active");
+
+    // ── F2：重新启用 ──
+    let resp = manage_user(&client, &base, &admin, member_id, "activate", None).await;
+    assert_eq!(resp.status(), 200, "admin 启用 member 应成功");
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(updated["is_active"], true, "启用响应应带 is_active=true");
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(member_id)
+        .fetch_one(&test_pool().await)
+        .await
+        .expect("read is_active");
+    assert!(is_active, "启用后 users.is_active 必须为 true");
+
+    // 启用后可正常登录
+    let (status, body) = login_body(&client, &base, "life-member", "member123").await;
+    assert_eq!(status, 200, "启用后应可重新登录");
+    let fresh_token = body["token"].as_str().expect("token").to_string();
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .bearer_auth(&fresh_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "启用后新 token 应可用");
+    // 说明：旧 token 的有效性由 is_active 实时决定（spec 第 4 条即按 token sub 查库校验），
+    // 因此启用后同一 token 也恢复可用；若要「一次性永久吊销」需 token 版本化，本单未做。
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "启用后旧 token 随 is_active 恢复可用（本单吊销语义 = 停用期间一律 401）"
+    );
+}
+
+/// F3（正负成对）：admin 可调停用/启用/重置；member 调同三个端点一律 403；无 token 401。
+#[tokio::test]
+async fn test_member_lifecycle_admin_only() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "role-admin", "admin123", "admin").await;
+    let member = setup_user(&client, &base, "role-member", "member123", "member").await;
+    let target_token = setup_user(&client, &base, "role-target", "member123", "member").await;
+    let target_id = user_id_by_name("role-target").await;
+
+    // 正：admin 能调（用启用做正向控件，不改状态也能验证 200）
+    let resp = manage_user(&client, &base, &admin, target_id, "activate", None).await;
+    assert_eq!(resp.status(), 200, "admin 调启用应 200");
+
+    // 负：member 调三个端点全部 403
+    for action in ["deactivate", "activate", "reset-password"] {
+        let body = if action == "reset-password" {
+            Some(serde_json::json!({ "password": "newpass123" }))
+        } else {
+            None
+        };
+        let resp = manage_user(&client, &base, &member, target_id, action, body).await;
+        assert_eq!(
+            resp.status(),
+            403,
+            "member 调 /users/:id/{} 必须 403",
+            action
+        );
+    }
+    // 负：即使请求体畸形，member 也应先收到 403（权限判定先于请求体解析）
+    let resp = client
+        .post(&format!("{}/api/users/{}/reset-password", base, target_id))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "member 带畸形请求体也必须 403（不得先报 400）");
+
+    // 未认证一律 401
+    let resp = client
+        .post(&format!("{}/api/users/{}/deactivate", base, target_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "无 token 调管理端点必须 401");
+
+    // 负向调用不得改变目标状态
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&test_pool().await)
+        .await
+        .expect("read is_active");
+    assert!(is_active, "member 的 403 调用不得改状态");
+    // member token 仍可用（admin 的正向 activate 没有影响）
+    let resp = client
+        .get(&format!("{}/api/customers", base))
+        .bearer_auth(&target_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+/// F4 自锁防线（正负成对）：
+/// 有多名 admin 时停自己 → 400；把其他 admin 停掉、只剩自己是最后一名启用 admin → 409。
+#[tokio::test]
+async fn test_member_lifecycle_self_lock_guards() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin_a = setup_user(&client, &base, "lock-admin-a", "admin123", "admin").await;
+    let _admin_b = setup_user(&client, &base, "lock-admin-b", "admin123", "admin").await;
+    let admin_a_id = user_id_by_name("lock-admin-a").await;
+    let admin_b_id = user_id_by_name("lock-admin-b").await;
+
+    // 负：多 admin 时停自己 → 400（禁止停用自己）
+    let resp = manage_user(&client, &base, &admin_a, admin_a_id, "deactivate", None).await;
+    assert_eq!(resp.status(), 400, "停用自己必须被拒");
+    // 负向调用不改状态
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(admin_a_id)
+        .fetch_one(&test_pool().await)
+        .await
+        .expect("read is_active");
+    assert!(is_active, "被拒的停自己不得改状态");
+
+    // 正：停用另一名 admin 成功（此刻启用中 admin 还剩 admin_a 一人）
+    let resp = manage_user(&client, &base, &admin_a, admin_b_id, "deactivate", None).await;
+    assert_eq!(resp.status(), 200, "停用另一名 admin 应成功");
+
+    // 负：admin_a 已是最后一名启用 admin → 停自己 409（最后管理员防线）
+    let resp = manage_user(&client, &base, &admin_a, admin_a_id, "deactivate", None).await;
+    assert_eq!(
+        resp.status(),
+        409,
+        "停用本租户最后一个启用管理员必须被拒（409）"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("最后一个管理员"),
+        "报错应说明最后管理员防线，实际: {body}"
+    );
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(admin_a_id)
+        .fetch_one(&test_pool().await)
+        .await
+        .expect("read is_active");
+    assert!(is_active, "最后一名 admin 不得被停用");
+
+    // 正：重新启用 admin_b 后，admin_a 停自己回到「禁止停用自己」的 400
+    let resp = manage_user(&client, &base, &admin_a, admin_b_id, "activate", None).await;
+    assert_eq!(resp.status(), 200);
+    let resp = manage_user(&client, &base, &admin_a, admin_a_id, "deactivate", None).await;
+    assert_eq!(resp.status(), 400, "有同僚 admin 时停自己仍是 400");
+}
+
+/// F5 审计 + 重置密码正负成对：
+/// admin 重置 → 旧密码 401 / 新密码 200；停用/启用/重置各留一条审计且审计不含明文密码。
+#[tokio::test]
+async fn test_member_lifecycle_audit_and_reset_password() {
+    let base = start_server().await;
+    let client = Client::new();
+    let admin = setup_user(&client, &base, "audit-admin", "admin123", "admin").await;
+    let _member = setup_user(&client, &base, "audit-member", "member123", "member").await;
+    let member_id = user_id_by_name("audit-member").await;
+    let tenant_id = current_tenant_id().await;
+
+    // 重置前旧密码可登录（正基线）
+    let (status, _) = login_body(&client, &base, "audit-member", "member123").await;
+    assert_eq!(status, 200, "重置前旧密码应可登录");
+
+    // 正：admin 重置密码
+    let new_password = "brand-new-pass-2026";
+    let resp = manage_user(
+        &client,
+        &base,
+        &admin,
+        member_id,
+        "reset-password",
+        Some(serde_json::json!({ "password": new_password })),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "admin 重置密码应成功");
+    // 负：旧密码 401
+    let (status, _) = login_body(&client, &base, "audit-member", "member123").await;
+    assert_eq!(status, 401, "重置后旧密码必须失效");
+    // 正：新密码可登录
+    let (status, _) = login_body(&client, &base, "audit-member", new_password).await;
+    assert_eq!(status, 200, "重置后新密码应可登录");
+
+    // 另两类操作（停用/启用）也各做一次，供审计断言
+    let resp = manage_user(&client, &base, &admin, member_id, "deactivate", None).await;
+    assert_eq!(resp.status(), 200);
+    let resp = manage_user(&client, &base, &admin, member_id, "activate", None).await;
+    assert_eq!(resp.status(), 200);
+
+    // F5：三类操作各一条审计记录
+    let pool = test_pool().await;
+    for action in ["user.deactivate", "user.activate", "user.reset_password"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_logs \
+             WHERE tenant_id = $1 AND entity_type = 'user' AND entity_id = $2 AND action = $3",
+        )
+        .bind(tenant_id)
+        .bind(member_id.to_string())
+        .bind(action)
+        .fetch_one(&pool)
+        .await
+        .expect("count audit");
+        assert_eq!(count, 1, "{action} 应恰好一条审计记录");
+    }
+
+    // 负：审计 detail 不得出现重置后的明文密码
+    let details: Vec<String> = sqlx::query_scalar(
+        "SELECT COALESCE(detail, '') FROM audit_logs \
+         WHERE tenant_id = $1 AND entity_id = $2 AND action = 'user.reset_password'",
+    )
+    .bind(tenant_id)
+    .bind(member_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("audit details");
+    for detail in details {
+        assert!(
+            !detail.contains(new_password),
+            "审计 detail 不得写入明文密码: {detail}"
+        );
+    }
+}

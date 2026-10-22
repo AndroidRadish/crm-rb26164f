@@ -27,7 +27,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => {
             return (

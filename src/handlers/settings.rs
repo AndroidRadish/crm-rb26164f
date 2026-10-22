@@ -12,7 +12,7 @@ use crate::services::{audit, auth, feature};
 const KEYS: &[&str] = &["wecom_webhook_url", "dingtalk_webhook_url"];
 
 pub async fn get_settings(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => {
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
@@ -60,7 +60,7 @@ pub async fn put_settings(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => {
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()

@@ -48,7 +48,7 @@ const TASK_SELECT: &str = "SELECT t.id, t.tenant_id, t.customer_id, t.user_id, t
 
 /// GET /api/tasks — 待办列表（admin 全团队，member 仅自己）
 pub async fn list(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -86,7 +86,7 @@ pub async fn list(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoRe
 /// GET /api/tasks/overdue — 逾期任务列表（status=pending 且 due_at < now()）
 /// member 自己口径 / admin 全团队口径；功能分级 crm.reminders（跟进提醒）
 pub async fn overdue(State(pool): State<PgPool>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -131,7 +131,7 @@ pub async fn list_by_customer(
     headers: HeaderMap,
     Path(customer_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -191,7 +191,7 @@ pub async fn create(
     Path(customer_id): Path<Uuid>,
     Json(req): Json<CreateTaskRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -276,7 +276,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
@@ -376,7 +376,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let user = match auth::extract_user(&headers) {
+    let user = match auth::require_user(&pool, &headers).await {
         Ok(u) => u,
         Err(_) => return unauthorized().into_response(),
     };
