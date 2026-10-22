@@ -1,0 +1,4 @@
+[env]
+# 集成测试共享同一个测试库且每个用例都会清库/启动服务，必须串行。
+# bare `cargo test` 也能全绿（CI 显式 --test-threads=1 双保险）。
+RUST_TEST_THREADS = "1"
