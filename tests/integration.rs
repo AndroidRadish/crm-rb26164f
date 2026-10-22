@@ -3134,6 +3134,17 @@ async fn test_member_lifecycle_deactivate_revokes_login_and_old_token() {
     let member = setup_user(&client, &base, "life-member", "member123", "member").await;
     let member_id = user_id_by_name("life-member").await;
 
+    // 正基线：用户详情（/auth/me）响应必须带 is_active
+    let resp = client
+        .get(&format!("{}/api/auth/me", base))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "启用中的成员应能读取本人详情");
+    let me: Value = resp.json().await.unwrap();
+    assert_eq!(me["is_active"], true, "用户详情响应必须带 is_active=true");
+
     // 正基线：停用前 member 的 token 可用
     let resp = client
         .get(&format!("{}/api/customers", base))
@@ -3189,6 +3200,15 @@ async fn test_member_lifecycle_deactivate_revokes_login_and_old_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "停用后旧 token 访问详情也必须 401");
+    // ④ 写端点同样被拦（"一律 401" 不只覆盖读端点）：请求体合法也必须先被鉴权拒绝
+    let resp = client
+        .post(&format!("{}/api/customers", base))
+        .bearer_auth(&member)
+        .json(&serde_json::json!({ "company": "停用后不应创建" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "停用后旧 token 调写端点也必须 401");
 
     // 列表响应带 is_active（admin 可见）
     let resp = client
