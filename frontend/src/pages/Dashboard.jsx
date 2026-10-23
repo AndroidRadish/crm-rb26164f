@@ -4,7 +4,7 @@ import * as api from '../api'
 import { Page, Sidebar, getNavItems } from '../components/Layout'
 import {
   Button, Callout, Card, CardSkeleton, EmptyState, ErrorState, Field, Input,
-  PageHeader, StatCard,
+  PageHeader, Skeleton, StatCard,
 } from '../components/ui'
 import { getErrorMessage } from '../api/client'
 import FeatureGate from '../components/FeatureGate'
@@ -171,8 +171,8 @@ function WebhookSettings() {
     <Card title="提醒设置" subtitle="企业微信 / 钉钉机器人 webhook" className="u-mt-4">
       {loading ? (
         <div className="u-col u-gap-3">
-          <div className="skeleton skeleton-line" />
-          <div className="skeleton skeleton-line" />
+          <Skeleton className="skeleton-line" />
+          <Skeleton className="skeleton-line" />
         </div>
       ) : (
         <>
