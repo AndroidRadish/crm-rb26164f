@@ -11,7 +11,6 @@ import { useAuth } from '../auth'
 export default function Kanban() {
   const navigate = useNavigate()
   const { user, hasFeature } = useAuth()
-  const isAdmin = user?.role === 'admin'
   const canPool = hasFeature('pool.claim')
   const [columns, setColumns] = useState([])
   const [loading, setLoading] = useState(true)
@@ -149,12 +148,7 @@ export default function Kanban() {
         ) : columns.length === 0 ? (
           <EmptyState
             title="暂无销售阶段"
-            description={isAdmin
-              ? '先到「销售阶段」创建阶段，客户看板按阶段分列展示。'
-              : '管理员还未配置销售阶段；配置后客户会按阶段分列展示。'}
-            action={isAdmin
-              ? <Button variant="primary" onClick={() => navigate('/stages')}>去销售阶段</Button>
-              : undefined}
+            description="管理员配置销售阶段后，客户会按阶段分列展示并可拖拽推进。"
           />
         ) : (
           <>

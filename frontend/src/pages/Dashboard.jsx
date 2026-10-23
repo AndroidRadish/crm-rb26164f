@@ -84,9 +84,6 @@ export default function Dashboard() {
                       inline
                       title="暂无漏斗数据"
                       description="客户还未进入任何销售阶段；在客户详情里设置阶段后即可看到分布。"
-                      action={isAdmin
-                        ? <Button size="sm" variant="secondary" onClick={() => navigate('/stages')}>管理销售阶段</Button>
-                        : undefined}
                     />
                   ) : (
                     <div className="funnel">
