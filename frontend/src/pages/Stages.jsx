@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react'
 import * as api from '../api'
 import { Page, Sidebar, getNavItems } from '../components/Layout'
-import { TableSkeleton, EmptyState } from '../components/ui'
+import {
+  Button, Callout, Checkbox, EmptyState, ErrorState, Field, Input, Modal, PageHeader,
+  Table, TableSkeleton, Tag,
+} from '../components/ui'
 import { getErrorMessage } from '../api/client'
 import { useAuth } from '../auth'
+
+const EMPTY_FORM = { name: '', order_index: '', is_won: false, is_lost: false }
 
 export default function Stages() {
   const { user } = useAuth()
@@ -11,8 +16,10 @@ export default function Stages() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showForm, setShowForm] = useState(false)
-  const [form, setForm] = useState({ name: '', order_index: '', is_won: false, is_lost: false })
+  const [form, setForm] = useState(EMPTY_FORM)
   const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [busyId, setBusyId] = useState(null)
 
   const load = async () => {
     setLoading(true)
@@ -29,10 +36,21 @@ export default function Stages() {
 
   useEffect(() => { load() }, [])
 
+  const openForm = () => {
+    setFormError('')
+    setShowForm(true)
+  }
+
+  const closeForm = () => {
+    setShowForm(false)
+    setFormError('')
+  }
+
   const create = async (e) => {
     e.preventDefault()
     setFormError('')
     if (!form.name.trim()) { setFormError('请填写阶段名称'); return }
+    setSubmitting(true)
     try {
       await api.createStage({
         name: form.name,
@@ -40,30 +58,38 @@ export default function Stages() {
         is_won: form.is_won,
         is_lost: form.is_lost,
       })
-      setForm({ name: '', order_index: '', is_won: false, is_lost: false })
+      setForm(EMPTY_FORM)
       setShowForm(false)
       load()
     } catch (err) {
       setFormError(getErrorMessage(err, '创建阶段失败'))
+    } finally {
+      setSubmitting(false)
     }
   }
 
   const update = async (id, data) => {
+    setBusyId(id)
     try {
       await api.updateStage(id, data)
       load()
     } catch (err) {
       setError(getErrorMessage(err, '更新阶段失败'))
+    } finally {
+      setBusyId(null)
     }
   }
 
   const remove = async (id) => {
     if (!confirm('确定删除该阶段？')) return
+    setBusyId(id)
     try {
       await api.deleteStage(id)
       load()
     } catch (err) {
       setError(getErrorMessage(err, '删除阶段失败'))
+    } finally {
+      setBusyId(null)
     }
   }
 
@@ -71,84 +97,118 @@ export default function Stages() {
     <div className="layout">
       <Sidebar navItems={getNavItems(user)} />
       <Page>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h1 className="page-title">销售阶段管理</h1>
-          <button className="btn btn-primary" onClick={() => setShowForm(!showForm)}>
-            {showForm ? '取消' : '+ 新增阶段'}
-          </button>
-        </div>
+        <PageHeader
+          title="销售阶段管理"
+          description="阶段顺序决定漏斗与看板列顺序；赢单/输单阶段参与成交率统计"
+          actions={<Button variant="primary" onClick={openForm}>+ 新增阶段</Button>}
+        />
 
-        {showForm && (
-          <div className="card" style={{ marginBottom: 24, maxWidth: 480 }}>
-            <div className="card-title">新增销售阶段</div>
-            {formError && <div className="form-error">{formError}</div>}
-            <form onSubmit={create}>
-              <div className="form-group">
-                <label className="form-label">阶段名称 *</label>
-                <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-              </div>
-              <div className="form-group">
-                <label className="form-label">排序（数字越小越靠前）</label>
-                <input type="number" value={form.order_index} onChange={(e) => setForm({ ...form, order_index: e.target.value })} />
-              </div>
-              <div className="form-group" style={{ display: 'flex', gap: 16 }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <input type="checkbox" checked={form.is_won} onChange={(e) => setForm({ ...form, is_won: e.target.checked })} style={{ width: 'auto' }} />
-                  赢单
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <input type="checkbox" checked={form.is_lost} onChange={(e) => setForm({ ...form, is_lost: e.target.checked })} style={{ width: 'auto' }} />
-                  输单
-                </label>
-              </div>
-              <button type="submit" className="btn btn-primary">创建</button>
-            </form>
-          </div>
-        )}
-
-        {error && <div className="form-error">{error}</div>}
-        {loading ? (
-          <TableSkeleton rows={4} />
-        ) : stages.length === 0 ? (
-          <EmptyState message="暂无销售阶段" />
+        {error && stages.length === 0 ? (
+          <ErrorState message={error} onRetry={load} />
         ) : (
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>排序</th>
-                  <th>名称</th>
-                  <th>类型</th>
-                  <th>状态</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
+          <>
+            {error && (
+              <Callout tone="danger" actions={<Button size="sm" variant="secondary" onClick={load}>重试</Button>}>
+                {error}
+              </Callout>
+            )}
+
+            {loading ? (
+              <TableSkeleton rows={5} />
+            ) : stages.length === 0 ? (
+              <EmptyState
+                title="暂无销售阶段"
+                description="创建阶段后，客户可以按阶段推进，看板与漏斗才有数据。"
+                action={<Button variant="primary" onClick={openForm}>+ 新增阶段</Button>}
+              />
+            ) : (
+              <Table columns={['排序', '名称', '类型', '状态', '操作']}>
                 {stages.map((s) => (
                   <tr key={s.id}>
-                    <td>{s.order_index}</td>
+                    <td className="cell-muted">{s.order_index}</td>
                     <td>{s.name}</td>
                     <td>
-                      {s.is_won ? <span className="badge badge-settled">赢单</span> :
-                       s.is_lost ? <span className="badge badge-past">输单</span> :
-                       <span className="badge badge-lead">进行中</span>}
+                      {s.is_won
+                        ? <Tag tone="success">赢单</Tag>
+                        : s.is_lost
+                          ? <Tag tone="muted">输单</Tag>
+                          : <Tag tone="info">进行中</Tag>}
                     </td>
-                    <td>{s.is_active ? '启用' : '停用'}</td>
                     <td>
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => update(s.id, { is_active: !s.is_active })}
-                      >
-                        {s.is_active ? '停用' : '启用'}
-                      </button>
-                      <button className="btn btn-danger btn-sm" onClick={() => remove(s.id)}>删除</button>
+                      {s.is_active
+                        ? <Tag tone="accent">启用</Tag>
+                        : <Tag tone="muted">停用</Tag>}
+                    </td>
+                    <td>
+                      <div className="table-actions">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          loading={busyId === s.id}
+                          onClick={() => update(s.id, { is_active: !s.is_active })}
+                        >
+                          {s.is_active ? '停用' : '启用'}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          disabled={busyId === s.id}
+                          onClick={() => remove(s.id)}
+                        >
+                          删除
+                        </Button>
+                      </div>
                     </td>
                   </tr>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </Table>
+            )}
+          </>
         )}
+
+        <Modal
+          open={showForm}
+          onClose={closeForm}
+          title="新增销售阶段"
+          description="排序数字越小越靠前；同一阶段不要同时标记赢单与输单"
+          footer={(
+            <>
+              <Button variant="secondary" onClick={closeForm} disabled={submitting}>取消</Button>
+              <Button variant="primary" type="submit" form="stage-create-form" loading={submitting}>创建</Button>
+            </>
+          )}
+        >
+          {formError && <Callout tone="danger">{formError}</Callout>}
+          <form id="stage-create-form" onSubmit={create}>
+            <Field label="阶段名称" required htmlFor="stage-name">
+              <Input
+                id="stage-name"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </Field>
+            <Field label="排序" hint="数字越小越靠前" htmlFor="stage-order">
+              <Input
+                id="stage-order"
+                type="number"
+                value={form.order_index}
+                onChange={(e) => setForm({ ...form, order_index: e.target.value })}
+              />
+            </Field>
+            <div className="u-row u-gap-5">
+              <Checkbox
+                label="赢单"
+                checked={form.is_won}
+                onChange={(e) => setForm({ ...form, is_won: e.target.checked })}
+              />
+              <Checkbox
+                label="输单"
+                checked={form.is_lost}
+                onChange={(e) => setForm({ ...form, is_lost: e.target.checked })}
+              />
+            </div>
+          </form>
+        </Modal>
       </Page>
     </div>
   )
